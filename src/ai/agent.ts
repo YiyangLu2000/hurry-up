@@ -51,7 +51,11 @@ function createAccessResolver(options: RegisterAgentOptions, resolveIdentity: ty
     // room failure must not present as a permission denial.
     const membership = await resolveAppMembership(env, auth.userId, request.signal)
     if (!membership) return { ok: false, status: 503 }
-    if (!membership.member) return { ok: false, status: 403 }
+    if (!membership.member) {
+      // Audit trail: a verified caller who has no user row in this app.
+      console.warn(`[agent] tools refused: user=${auth.userId} not an app member`)
+      return { ok: false, status: 403 }
+    }
 
     if (options.authorize) {
       try {

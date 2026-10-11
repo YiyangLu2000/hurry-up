@@ -1,5 +1,5 @@
 /**
- * Restroom routes: OpenStreetMap seeding and a local-only status toggle.
+ * Restroom routes: OpenStreetMap live seeding (the fallback for areas not imported).
  *
  * POST /api/restrooms/seed { cellKey }
  *   Public (signed-out visitors seed too). Fetches one seeding-grid cell from
@@ -8,22 +8,18 @@
  *   so a status set later survives re-seeding. A cell is marked fetched only
  *   after Overpass answered and every new row saved; fresh cells are skipped.
  *
- * POST /api/restrooms/:id/status { status }
- *   Admin-only and only where ALLOW_DEBUG_ROUTES is "true" (deepspace dev).
- *   A testing aid for the visibility rule, not a product feature.
+ * Status changes go through the admin CLI tool `restrooms_set_status`
+ * (src/server/restroom-admin-tools.ts).
  *
  * Writes go through the RBAC-bypassing record tools as a system identity, so
  * no real user owns a restroom row (which keeps 'published' reads exact).
  */
 
 import type { Hono } from 'hono'
-import { resolveAppRole } from 'deepspace/worker'
 import { cellFromKey, cellTouchesUS, type Cell } from '../lib/us-geo.js'
 import { toRestroom, type OverpassElement } from '../lib/osm-restrooms.js'
-import type { RestroomStatus } from '../schemas/restrooms-schema.js'
 import { createActionTools } from './action-routes.js'
 import { saveNewRestrooms } from './restroom-writes.js'
-import { resolveAuth } from './http-routes.js'
 import type { AppContext, Env } from '../../worker.js'
 
 const SEEDER_USER_ID = 'system:osm-seeder'
@@ -124,8 +120,6 @@ async function seedCell(env: Env, cell: Cell): Promise<SeedResult> {
   return { status: 'seeded', found: rows.length, created }
 }
 
-const STATUSES: RestroomStatus[] = ['active', 'unavailable', 'pending']
-
 export function registerRestroomRoutes(app: Hono<AppContext>): void {
   app.post('/api/restrooms/seed', async (c) => {
     const body = await c.req.json<{ cellKey?: unknown }>().catch(() => null)
@@ -152,25 +146,5 @@ export function registerRestroomRoutes(app: Hono<AppContext>): void {
       }
       return c.json({ success: false, error: 'save_failed' }, 500)
     }
-  })
-
-  app.post('/api/restrooms/:id/status', async (c) => {
-    if (c.env.ALLOW_DEBUG_ROUTES !== 'true') return c.json({ error: 'not_found' }, 404)
-    const auth = await resolveAuth(c.req.raw, c.env)
-    if (!auth) return c.json({ error: 'unauthorized' }, 401)
-    if ((await resolveAppRole(c.env, auth.userId)) !== 'admin') {
-      return c.json({ error: 'forbidden' }, 403)
-    }
-    const body = await c.req.json<{ status?: unknown }>().catch(() => null)
-    const status = body?.status
-    if (typeof status !== 'string' || !STATUSES.includes(status as RestroomStatus)) {
-      return c.json({ error: 'invalid_status' }, 400)
-    }
-    console.info(`[restrooms] status ${c.req.param('id')} -> ${status} by ${auth.userId}`)
-    const tools = createActionTools(c.env, auth.userId, '')
-    const id = c.req.param('id')
-    const existing = await tools.get('restrooms', id)
-    if (!existing.success) return c.json({ error: 'not_found' }, 404)
-    return c.json(await tools.update('restrooms', id, { status }))
   })
 }

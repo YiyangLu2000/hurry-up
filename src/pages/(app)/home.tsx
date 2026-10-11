@@ -23,7 +23,7 @@ import type {
   Marker as MapLibreMarker,
 } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import { getAuthToken, useAuthProfileReady } from 'deepspace'
+import { useAuthProfileReady } from 'deepspace'
 import { Accessibility, Car, Footprints, Info, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LocationControl } from '../../components/LocationControl'
@@ -933,7 +933,7 @@ export default function HomePage() {
               : null
           }
           routePending={routePending}
-          canToggleStatus={isAdmin && import.meta.env.DEV}
+          showAdminInfo={isAdmin}
           onClose={() => select(null)}
         />
       )}
@@ -989,7 +989,7 @@ function RestroomDetails({
   onTravelModeChange,
   route,
   routePending,
-  canToggleStatus,
+  showAdminInfo,
   onClose,
 }: {
   id: string
@@ -999,30 +999,10 @@ function RestroomDetails({
   onTravelModeChange: (mode: TravelMode) => void
   route: Route | { kind: 'fallback' } | null
   routePending: boolean
-  canToggleStatus: boolean
+  showAdminInfo: boolean
   onClose: () => void
 }) {
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
   const isRestaurant = restroom.kind === 'restaurant'
-
-  const setStatus = async (status: 'active' | 'unavailable') => {
-    setBusy(true)
-    setError(null)
-    try {
-      const res = await fetch(`/api/restrooms/${encodeURIComponent(id)}/status`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${(await getAuthToken()) ?? ''}`,
-        },
-        body: JSON.stringify({ status }),
-      })
-      if (!res.ok) setError(`Status change refused (${res.status})`)
-    } finally {
-      setBusy(false)
-    }
-  }
 
   return (
     <section
@@ -1074,21 +1054,11 @@ function RestroomDetails({
         routePending={routePending}
       />
 
-      {canToggleStatus && (
-        <div className="mt-3 border-t border-border pt-3 text-xs">
-          <p className="mb-2 text-muted-foreground">
-            Dev only · status: <strong>{restroom.status}</strong>
-          </p>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => setStatus(restroom.status === 'active' ? 'unavailable' : 'active')}
-            className="rounded-md border border-border px-2.5 py-1 hover:bg-muted disabled:opacity-50"
-          >
-            {restroom.status === 'active' ? 'Mark unavailable' : 'Mark active'}
-          </button>
-          {error && <p className="mt-2 text-destructive">{error}</p>}
-        </div>
+      {showAdminInfo && (
+        // Read-only: status changes go through the restrooms_set_status CLI tool.
+        <p data-testid="admin-info" className="mt-3 border-t border-border pt-3 text-xs text-muted-foreground">
+          Admin · status <strong>{restroom.status}</strong> · id <code className="select-all">{id}</code>
+        </p>
       )}
     </section>
   )
