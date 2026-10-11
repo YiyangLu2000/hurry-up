@@ -190,19 +190,38 @@ export default function HomePage() {
   )
   // The selected restroom and the route target keep their last-seen record,
   // so the panel and route survive their cell unloading (pan away, zoom out).
+  // The copy only stands in while that cell is not loaded: if the cell is
+  // loaded and the restroom is gone, the server removed it (e.g. it became
+  // unavailable), so it must disappear here too.
   const byId = useMemo(() => new Map(records.map((r) => [r.recordId, r])), [records])
   const pinned = useRef(new Map<string, RestroomRecord>())
-  const lookup = (id: string | null) => (id ? (byId.get(id) ?? pinned.current.get(id) ?? null) : null)
+  const lookup = (id: string | null): RestroomRecord | null => {
+    if (!id) return null
+    const live = byId.get(id)
+    if (live) return live
+    const copy = pinned.current.get(id)
+    if (!copy || cellData.get(copy.data.cellKey)?.ready) return null
+    return copy
+  }
   const selected = lookup(selectedId)
   const routeTarget = lookup(routeTargetId)
   useEffect(() => {
     const keep = new Map<string, RestroomRecord>()
     for (const id of [selectedId, routeTargetId]) {
-      const r = id ? (byId.get(id) ?? pinned.current.get(id)) : undefined
-      if (id && r) keep.set(id, r)
+      const live = id ? byId.get(id) : undefined
+      const copy = id ? pinned.current.get(id) : undefined
+      const removed = copy && !live && cellData.get(copy.data.cellKey)?.ready
+      if (id && (live ?? (removed ? undefined : copy))) keep.set(id, (live ?? copy)!)
     }
     pinned.current = keep
-  }, [byId, selectedId, routeTargetId])
+  }, [byId, cellData, selectedId, routeTargetId])
+
+  // A restroom removed while selected (e.g. marked unavailable) closes its
+  // panel; one removed while it was the route target drops the route.
+  useEffect(() => {
+    if (selectedId && !selected) setSelectedId(null)
+    if (routeTargetId && !routeTarget) setRouteTargetId(null)
+  }, [selectedId, selected, routeTargetId, routeTarget])
 
   // Which cells to subscribe: the ones in view (capped), plus recently used.
   const retainedCells = useRef<string[]>([])
