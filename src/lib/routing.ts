@@ -7,7 +7,8 @@
  * at most one request per second, no scraping or heavy use. Browsers send
  * their own user agent and the app's origin as the referrer; requests here
  * are one per selection or travel-mode change, cached for the session, and
- * spaced at least a second apart.
+ * spaced at least a second apart. The auto-select comparison adds one table
+ * (matrix) request per page load: one origin to at most six restrooms.
  */
 
 import type { TravelMode } from './directions'
@@ -114,4 +115,78 @@ export function formatDuration(seconds: number): string {
   const h = Math.floor(minutes / 60)
   const m = minutes % 60
   return m ? `${h} h ${m} min` : `${h} h`
+}
+
+/** Walking duration (s) and distance (m) from the table service, per destination. */
+export type WalkLeg = { duration: number; distance: number } | null
+
+/**
+ * Walking duration and distance from `from` to each of `to`, in one table
+ * request. Resolves null on failure, an error answer, or after `timeoutMs`
+ * (which includes the one-second request spacing); rejects only if `signal`
+ * aborts.
+ */
+export async function fetchWalkingTable(
+  from: Point,
+  to: Point[],
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<WalkLeg[] | null> {
+  if (to.length === 0) return []
+  const deadline = Date.now() + timeoutMs
+  const gap = lastRequestAt + MIN_REQUEST_GAP_MS - Date.now()
+  if (gap > 0) {
+    if (Date.now() + gap >= deadline) return null
+    await wait(gap, signal)
+  }
+  lastRequestAt = Date.now()
+
+  const timeout = new AbortController()
+  const timer = setTimeout(() => timeout.abort(new Error('table timeout')), Math.max(0, deadline - Date.now()))
+  const onAbort = () => timeout.abort(signal.reason)
+  signal.addEventListener('abort', onAbort)
+  try {
+    const coords = [from, ...to].map(fixed).join(';')
+    const destinations = to.map((_, i) => i + 1).join(';')
+    const url = `${BASE.walk}/table/v1/driving/${coords}?sources=0&destinations=${destinations}&annotations=duration,distance`
+    const res = await fetch(url, { signal: timeout.signal })
+    if (!res.ok) return null
+    const body = (await res.json()) as {
+      code?: string
+      durations?: (number | null)[][]
+      distances?: (number | null)[][]
+    }
+    const durations = body.code === 'Ok' ? body.durations?.[0] : undefined
+    const distances = body.distances?.[0]
+    if (!durations || durations.length !== to.length) return null
+    return durations.map((d, i) => {
+      const m = distances?.[i]
+      return typeof d === 'number' && typeof m === 'number' ? { duration: d, distance: m } : null
+    })
+  } catch (err) {
+    if (signal.aborted) throw err
+    return null
+  } finally {
+    clearTimeout(timer)
+    signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * Which candidate to auto-select, as an index into the candidates, which are
+ * in straight-line order (nearest first); `legs` are their walking legs, or
+ * null when the comparison failed. The shortest walking duration wins (ties keep straight-line order);
+ * with no usable durations, the straight-line nearest (index 0) wins.
+ */
+export function chooseByWalkingTime(candidateCount: number, legs: WalkLeg[] | null): number {
+  let best = 0
+  let bestDuration = Infinity
+  for (let i = 0; i < candidateCount; i++) {
+    const d = legs?.[i]?.duration
+    if (typeof d === 'number' && d < bestDuration) {
+      bestDuration = d
+      best = i
+    }
+  }
+  return best
 }

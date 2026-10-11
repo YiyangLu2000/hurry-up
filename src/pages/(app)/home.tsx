@@ -40,12 +40,15 @@ import {
   type TravelMode,
 } from '../../lib/directions'
 import {
+  chooseByWalkingTime,
   fetchRoute,
+  fetchWalkingTable,
   formatDuration,
   routeKey,
   ROUTING_ATTRIBUTION,
   type LineCoords,
   type Route,
+  type WalkLeg,
 } from '../../lib/routing'
 import {
   cellsInView,
@@ -80,6 +83,10 @@ const MAX_VIEW_CELLS = 36
 const RETAINED_CELLS = 64
 /** Auto-select only picks a restroom this close; farther is not "nearby". */
 const AUTO_SELECT_MAX_METERS = 5000
+/** Auto-select compares walking time for this many straight-line-nearest restrooms. */
+const AUTO_SELECT_CANDIDATES = 6
+/** Past this, auto-select falls back to the straight-line nearest. */
+const AUTO_SELECT_TABLE_TIMEOUT_MS = 2000
 /** Seeding waits this long for the first location answer before using the default city. */
 const SEED_LOCATION_WAIT_MS = 6000
 /** The selected marker's halo when not pulsing (reduced motion). */
@@ -107,6 +114,8 @@ const markerColor = [
 ] as ExpressionSpecification
 
 type RestroomRecord = CellRecords['records'][number]
+/** What the panel needs from a route: its length and duration. */
+type RouteSummary = Pick<Route, 'kind' | 'distance' | 'duration'>
 
 const GENDER_LABEL: Record<GenderType, string> = {
   men: 'Men',
@@ -156,6 +165,13 @@ export default function HomePage() {
   // Once per page load: set after the auto-selection, or when the user
   // selects, closes, pans, or filters while their location is known.
   const autoSelectDone = useRef(false)
+  // The walking-time comparison in flight, and whether the visitor acted
+  // (selected, panned, filtered) while it was — then its answer is dropped.
+  const autoSelectAbort = useRef<AbortController | null>(null)
+  const autoSelectInterrupted = useRef(false)
+  // Walking duration/distance of the auto-selected restroom, from the
+  // comparison, shown in its panel without another request.
+  const [walkLeg, setWalkLeg] = useState<(NonNullable<WalkLeg> & { recordId: string; fromKey: string }) | null>(null)
   const locationRef = useRef<Point | null>(userLocation)
   const seedPassesRef = useRef(0)
   const pickingRef = useRef(false)
@@ -272,6 +288,7 @@ export default function HomePage() {
       if (moved || !routeTargetIdRef.current) {
         setRouteTargetId(null)
         setSelectedId(null)
+        autoSelectAbort.current?.abort()
         autoSelectDone.current = false
       }
       setManual(p)
@@ -287,7 +304,10 @@ export default function HomePage() {
 
   /** User interaction ends the auto-select window, once a location is known. */
   const markInteraction = useCallback(() => {
-    if (locationRef.current) autoSelectDone.current = true
+    if (locationRef.current) {
+      autoSelectDone.current = true
+      autoSelectInterrupted.current = true
+    }
   }, [])
 
   const select = useCallback(
@@ -777,6 +797,13 @@ export default function HomePage() {
   // location (GPS or set on the map) becomes known. It waits for a seeding
   // pass that started afterwards, or a few seconds, so nearby rows are in.
   const locationKey = userLocation ? `${userLocation.latitude},${userLocation.longitude}` : null
+  const selectedIdRef = useRef<string | null>(null)
+  const locationKeyRef = useRef<string | null>(null)
+  useEffect(() => {
+    selectedIdRef.current = selectedId
+    locationKeyRef.current = locationKey
+  })
+  useEffect(() => () => autoSelectAbort.current?.abort(), [])
   useEffect(() => {
     if (!locationKey || autoSelectDone.current) return
     setAutoSelectWait({ key: locationKey, pass: seedPassesRef.current, expired: false })
@@ -796,23 +823,39 @@ export default function HomePage() {
     // judging "closest" earlier could miss restrooms still loading nearby.
     const seeded = seedState !== 'loading' && seedPasses > wait.pass
     if (!seeded && !wait.expired) return
-    let nearest = visible[0]
-    let best = Infinity
-    for (const r of visible) {
-      const d = distanceMeters(userLocation, r.data)
-      if (d < best) {
-        best = d
-        nearest = r
-      }
-    }
-    // Nothing nearby loaded yet: keep waiting for seeding (or until the user
+    // Candidates: the nearest restrooms in a straight line, within range.
+    // None nearby loaded yet: keep waiting for seeding (or until the user
     // interacts) rather than selecting something across the country.
-    if (best > AUTO_SELECT_MAX_METERS) return
+    const candidates = visible
+      .map((r) => ({ r, d: distanceMeters(userLocation, r.data) }))
+      .filter((c) => c.d <= AUTO_SELECT_MAX_METERS)
+      .sort((a, b) => a.d - b.d)
+      .slice(0, AUTO_SELECT_CANDIDATES)
+      .map((c) => c.r)
+    if (candidates.length === 0) return
+    // Claim this page load's one auto-select now; nothing is selected until
+    // the walking-time comparison answers (or times out).
     autoSelectDone.current = true
-    setSelectedId(nearest.recordId)
-    const map = mapRef.current
-    const at: [number, number] = [nearest.data.longitude, nearest.data.latitude]
-    if (map && !map.getBounds().contains(at)) map.easeTo({ center: at })
+    autoSelectInterrupted.current = false
+    const controller = new AbortController()
+    autoSelectAbort.current = controller
+    const from = userLocation
+    const fromKey = locationKey!
+    fetchWalkingTable(from, candidates.map((c) => c.data), controller.signal, AUTO_SELECT_TABLE_TIMEOUT_MS)
+      .catch(() => null)
+      .then((legs) => {
+        // Moved, selected, panned or filtered meanwhile: their choice stands.
+        if (controller.signal.aborted || autoSelectInterrupted.current) return
+        if (selectedIdRef.current || locationKeyRef.current !== fromKey) return
+        const index = chooseByWalkingTime(candidates.length, legs)
+        const chosen = candidates[index]
+        const leg = legs?.[index]
+        setWalkLeg(leg ? { ...leg, recordId: chosen.recordId, fromKey } : null)
+        setSelectedId(chosen.recordId)
+        const map = mapRef.current
+        const at: [number, number] = [chosen.data.longitude, chosen.data.latitude]
+        if (map && !map.getBounds().contains(at)) map.easeTo({ center: at })
+      })
   }, [
     userLocation,
     locationKey,
@@ -949,11 +992,20 @@ export default function HomePage() {
             // Also brings the route back if it was cleared with the panel open.
             setRouteTargetId(selected.recordId)
           }}
-          route={
-            route && route.targetId === selected.recordId && route.mode === travelMode
-              ? route.result
-              : null
-          }
+          route={(() => {
+            const own =
+              route && route.targetId === selected.recordId && route.mode === travelMode ? route.result : null
+            if (own?.kind === 'route') return own
+            // The auto-select comparison already measured this walk.
+            const measured =
+              walkLeg &&
+              travelMode === 'walk' &&
+              walkLeg.recordId === selected.recordId &&
+              walkLeg.fromKey === locationKey
+                ? { kind: 'route' as const, distance: walkLeg.distance, duration: walkLeg.duration }
+                : null
+            return measured ?? own
+          })()}
           routePending={routePending}
           showAdminInfo={isAdmin}
           onClose={() => select(null)}
@@ -1019,7 +1071,7 @@ function RestroomDetails({
   userLocation: { latitude: number; longitude: number } | null
   travelMode: TravelMode
   onTravelModeChange: (mode: TravelMode) => void
-  route: Route | { kind: 'fallback' } | null
+  route: RouteSummary | { kind: 'fallback' } | null
   routePending: boolean
   showAdminInfo: boolean
   onClose: () => void
@@ -1101,7 +1153,7 @@ function Directions({
   userLocation: { latitude: number; longitude: number } | null
   travelMode: TravelMode
   onTravelModeChange: (mode: TravelMode) => void
-  route: Route | { kind: 'fallback' } | null
+  route: RouteSummary | { kind: 'fallback' } | null
   routePending: boolean
 }) {
   const [provider, setProvider] = useState<MapsProvider>(() =>
