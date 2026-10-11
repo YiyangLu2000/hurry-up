@@ -5,14 +5,23 @@
  * ships rows the caller may read (active ones, for everyone but admins). The
  * map asks /api/restrooms/seed to fill in OpenStreetMap data for the grid
  * cells in view whenever it settles at a useful zoom.
+ *
+ * The visitor's location is GPS (when allowed) or a point they set on the map;
+ * either one drives the user dot, distances, and the closest-restroom pick.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ExpressionSpecification, GeoJSONSource, Map as MapLibreMap } from 'maplibre-gl'
+import type {
+  ExpressionSpecification,
+  GeoJSONSource,
+  Map as MapLibreMap,
+  Marker as MapLibreMarker,
+} from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { getAuthToken, useAuthProfileReady, useQuery } from 'deepspace'
 import { Accessibility, Car, Footprints, Info, MapPin, Utensils, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { LocationControl } from '../../components/LocationControl'
 import {
   directionsUrl,
   distanceMeters,
@@ -26,10 +35,12 @@ import {
 import {
   cellsInView,
   DEFAULT_CENTER,
-  isInUS,
   MIN_SEED_ZOOM,
   US_MAX_BOUNDS,
 } from '../../lib/us-geo'
+import type { Point } from '../../lib/location'
+import { isInUSOutline } from '../../lib/us-outline'
+import { useUserLocation } from '../../lib/use-user-location'
 import {
   GENDER_TYPES,
   RESTROOM_KINDS,
@@ -46,6 +57,8 @@ const SEED_BACKOFF_MAX_MS = 10 * 60_000
 const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c' }
 const UNAVAILABLE_COLOR = '#9ca3af'
 const AUTO_SELECT_WAIT_MS = 5000
+/** Seeding waits this long for the first location answer before using the default city. */
+const SEED_LOCATION_WAIT_MS = 6000
 /** The selected marker's halo when not pulsing (reduced motion). */
 const HALO_REST = { radius: 24, opacity: 0.5 }
 /** Hit area around a click, so small markers are easy to tap. */
@@ -66,24 +79,6 @@ const GENDER_LABEL: Record<GenderType, string> = {
 }
 const KIND_LABEL: Record<RestroomKind, string> = { public: 'Public', restaurant: 'Restaurant' }
 
-type LocationNote = 'locating' | 'yours' | 'denied' | 'outside-us'
-
-function locate(): Promise<{ latitude: number; longitude: number } | 'denied' | 'outside-us'> {
-  return new Promise((resolve) => {
-    if (!('geolocation' in navigator)) return resolve('denied')
-    navigator.geolocation.getCurrentPosition(
-      ({ coords }) =>
-        resolve(
-          isInUS(coords.latitude, coords.longitude)
-            ? { latitude: coords.latitude, longitude: coords.longitude }
-            : 'outside-us',
-        ),
-      () => resolve('denied'),
-      { timeout: 10_000, maximumAge: 5 * 60_000 },
-    )
-  })
-}
-
 export default function HomePage() {
   const { user } = useAuthProfileReady({ requireUser: true })
   const isAdmin = user?.role === 'admin'
@@ -92,21 +87,39 @@ export default function HomePage() {
   const [genders, setGenders] = useState<Set<GenderType>>(() => new Set(GENDER_TYPES))
   const [kinds, setKinds] = useState<Set<RestroomKind>>(() => new Set(RESTROOM_KINDS))
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [locationNote, setLocationNote] = useState<LocationNote>('locating')
   const [tooFarOut, setTooFarOut] = useState(false)
-  const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(
-    null,
-  )
+  const loc = useUserLocation()
+  const userLocation = loc.location
+  const [picking, setPicking] = useState(false)
+  const [pickError, setPickError] = useState<string | null>(null)
   const [seedState, setSeedState] = useState<'idle' | 'loading' | 'error'>('idle')
-  // Auto-select waits for the first seeding pass over the visitor's cells (or
-  // a short timeout), so "nearest" is not judged before nearby rows arrive.
-  const [initialSeedSettled, setInitialSeedSettled] = useState(false)
-  // Once per page load: set after the auto-selection, or as soon as the user
-  // selects, closes, pans, or filters — whichever comes first.
+  // Completed seeding passes; auto-select waits for one that started after the
+  // location became known (or a timeout), so nearby rows have arrived.
+  const [seedPasses, setSeedPasses] = useState(0)
+  const [autoSelectWait, setAutoSelectWait] = useState<{
+    key: string
+    pass: number
+    expired: boolean
+  } | null>(null)
+  // Once per page load: set after the auto-selection, or when the user
+  // selects, closes, pans, or filters while their location is known.
   const autoSelectDone = useRef(false)
+  const locationRef = useRef<Point | null>(userLocation)
+  const seedPassesRef = useRef(0)
+  const pickingRef = useRef(false)
+  useEffect(() => {
+    locationRef.current = userLocation
+    seedPassesRef.current = seedPasses
+    pickingRef.current = picking
+  })
+  // Seeding stays closed until the first location answer (or a timeout), so a
+  // visitor elsewhere does not trigger fetches for the default city.
+  const seedGateOpen = useRef(false)
 
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
+  const maplibreRef = useRef<typeof import('maplibre-gl') | null>(null)
+  const userMarkerRef = useRef<MapLibreMarker | null>(null)
   const [mapReady, setMapReady] = useState(false)
 
   const visible = useMemo(
@@ -116,10 +129,18 @@ export default function HomePage() {
   )
   const selected = records.find((r) => r.recordId === selectedId) ?? null
 
-  const select = useCallback((id: string | null) => {
-    autoSelectDone.current = true
-    setSelectedId(id)
+  /** User interaction ends the auto-select window, once a location is known. */
+  const markInteraction = useCallback(() => {
+    if (locationRef.current) autoSelectDone.current = true
   }, [])
+
+  const select = useCallback(
+    (id: string | null) => {
+      markInteraction()
+      setSelectedId(id)
+    },
+    [markInteraction],
+  )
 
   // Seeding. A cell is requested until it succeeds (or is refused as outside
   // the US). A failure stops the batch — Overpass being down affects every
@@ -132,13 +153,15 @@ export default function HomePage() {
 
   const seedView = useCallback(async (force = false) => {
     const map = mapRef.current
-    if (!map) return
+    if (!map || !seedGateOpen.current) return
     if (running.current) {
       rerun.current = true
       return
     }
+    const passDone = () => setSeedPasses((n) => n + 1)
     if (map.getZoom() < MIN_SEED_ZOOM) {
       setTooFarOut(true)
+      passDone()
       return
     }
     setTooFarOut(false)
@@ -153,7 +176,10 @@ export default function HomePage() {
       const wait = backoff.current.get(cell.key)
       return force || !wait || wait.retryAt <= now
     })
-    if (cells.length === 0) return
+    if (cells.length === 0) {
+      passDone()
+      return
+    }
 
     running.current = true
     setSeedState('loading')
@@ -190,6 +216,7 @@ export default function HomePage() {
     }
     running.current = false
     setSeedState(failed ? 'error' : 'idle')
+    passDone()
     if (rerun.current && !failed) {
       rerun.current = false
       void seedView()
@@ -197,20 +224,21 @@ export default function HomePage() {
     rerun.current = false
   }, [])
 
-  // Create the map once, then center it on the visitor (or the fallback).
+  // Create the map once, right away: at a location set earlier this session,
+  // else the default city. A GPS fix recenters it when it arrives.
   useEffect(() => {
     let cancelled = false
     let map: MapLibreMap | null = null
     let debounce: ReturnType<typeof setTimeout> | undefined
+    let gateTimer: ReturnType<typeof setTimeout> | undefined
 
     void (async () => {
-      const [{ default: maplibregl }, located] = await Promise.all([import('maplibre-gl'), locate()])
+      const maplibre = await import('maplibre-gl')
+      const maplibregl = maplibre.default
       if (cancelled || !containerRef.current) return
+      maplibreRef.current = maplibregl
 
-      const center = typeof located === 'object' ? located : DEFAULT_CENTER
-      setLocationNote(typeof located === 'object' ? 'yours' : located)
-      if (typeof located === 'object') setUserLocation(located)
-
+      const center = locationRef.current ?? DEFAULT_CENTER
       map = new maplibregl.Map({
         container: containerRef.current,
         style: MAP_STYLE,
@@ -221,11 +249,6 @@ export default function HomePage() {
       })
       mapRef.current = map
       map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-right')
-      if (typeof located === 'object') {
-        new maplibregl.Marker({ color: '#2563eb', scale: 0.7 })
-          .setLngLat([located.longitude, located.latitude])
-          .addTo(map)
-      }
 
       map.on('load', () => {
         if (!map) return
@@ -274,6 +297,17 @@ export default function HomePage() {
         // empty map clears the selection.
         map.on('click', (e) => {
           if (!map) return
+          if (pickingRef.current) {
+            const { lat, lng } = e.lngLat
+            if (!isInUSOutline(lat, lng)) {
+              setPickError('That point is outside the US. Pick a spot inside the US.')
+              return
+            }
+            setPickError(null)
+            setPicking(false)
+            loc.setManual({ latitude: lat, longitude: lng })
+            return
+          }
           const { x, y } = e.point
           const t = CLICK_TOLERANCE_PX
           const hit = map.queryRenderedFeatures(
@@ -295,14 +329,15 @@ export default function HomePage() {
           })
         }
         setMapReady(true)
-        const settle = () => setInitialSeedSettled(true)
-        setTimeout(settle, AUTO_SELECT_WAIT_MS)
-        void seedView().finally(settle)
+        gateTimer = setTimeout(() => {
+          seedGateOpen.current = true
+          void seedView()
+        }, SEED_LOCATION_WAIT_MS)
       })
 
       // A user pan or zoom (not our own easeTo) ends the auto-select window.
       map.on('movestart', (e) => {
-        if (e.originalEvent) autoSelectDone.current = true
+        if (e.originalEvent) markInteraction()
       })
 
       map.on('moveend', () => {
@@ -316,11 +351,71 @@ export default function HomePage() {
     return () => {
       cancelled = true
       clearTimeout(debounce)
+      clearTimeout(gateTimer)
       clearTimeout(retryTimer.current)
+      userMarkerRef.current = null
       map?.remove()
       mapRef.current = null
     }
-  }, [seedView, select])
+    // loc.setManual is a stable callback; the map is created once.
+  }, [seedView, select, markInteraction])
+
+  // Open seeding once the first location answer is in.
+  useEffect(() => {
+    if (!loc.settled || !mapReady || seedGateOpen.current) return
+    seedGateOpen.current = true
+    void seedView()
+  }, [loc.settled, mapReady, seedView])
+
+  // The first GPS fix of the page load recenters the map on it, unless the
+  // visitor has set their own location.
+  const centeredOnGps = useRef(false)
+  useEffect(() => {
+    const map = mapReady ? mapRef.current : null
+    if (!map || !loc.gps || centeredOnGps.current || loc.manual) return
+    centeredOnGps.current = true
+    map.jumpTo({ center: [loc.gps.longitude, loc.gps.latitude] })
+  }, [loc.gps, loc.manual, mapReady])
+
+  // The user dot: solid blue for GPS, dashed violet ring for a set location.
+  useEffect(() => {
+    const map = mapReady ? mapRef.current : null
+    const maplibre = maplibreRef.current
+    userMarkerRef.current?.remove()
+    userMarkerRef.current = null
+    if (!map || !maplibre || !userLocation || !loc.source) return
+    const el = document.createElement('div')
+    el.dataset.testid = `user-dot-${loc.source}`
+    el.title = loc.source === 'gps' ? 'Your location' : 'Location you set'
+    Object.assign(
+      el.style,
+      loc.source === 'gps'
+        ? {
+            width: '16px',
+            height: '16px',
+            borderRadius: '9999px',
+            background: '#2563eb',
+            border: '3px solid #ffffff',
+            boxShadow: '0 0 0 6px rgba(37, 99, 235, 0.25)',
+          }
+        : {
+            width: '18px',
+            height: '18px',
+            borderRadius: '9999px',
+            background: 'rgba(124, 58, 237, 0.15)',
+            border: '3px dashed #7c3aed',
+          },
+    )
+    userMarkerRef.current = new maplibre.Marker({ element: el })
+      .setLngLat([userLocation.longitude, userLocation.latitude])
+      .addTo(map)
+  }, [userLocation, loc.source, mapReady])
+
+  // Crosshair cursor while picking a location.
+  useEffect(() => {
+    const canvas = mapReady ? mapRef.current?.getCanvas() : undefined
+    if (canvas) canvas.style.cursor = picking ? 'crosshair' : ''
+  }, [picking, mapReady])
 
   // Push filtered records into the map source.
   useEffect(() => {
@@ -358,10 +453,27 @@ export default function HomePage() {
     return () => cancelAnimationFrame(frame)
   }, [selectedId, mapReady])
 
-  // Auto-select the nearest matching restroom, once, for a real location.
+  // Auto-select the nearest matching restroom, once per page load, when a
+  // location (GPS or set on the map) becomes known. It waits for a seeding
+  // pass that started afterwards, or a few seconds, so nearby rows are in.
+  const locationKey = userLocation ? `${userLocation.latitude},${userLocation.longitude}` : null
   useEffect(() => {
-    if (autoSelectDone.current || !userLocation || !mapReady) return
-    if (recordsStatus !== 'ready' || !initialSeedSettled || visible.length === 0) return
+    if (!locationKey || autoSelectDone.current) return
+    setAutoSelectWait({ key: locationKey, pass: seedPassesRef.current, expired: false })
+    const timer = setTimeout(
+      () => setAutoSelectWait((w) => (w && w.key === locationKey ? { ...w, expired: true } : w)),
+      AUTO_SELECT_WAIT_MS,
+    )
+    return () => clearTimeout(timer)
+  }, [locationKey])
+
+  useEffect(() => {
+    if (autoSelectDone.current || !userLocation || !mapReady || selectedId) return
+    if (recordsStatus !== 'ready' || visible.length === 0) return
+    const wait = autoSelectWait
+    if (!wait || wait.key !== locationKey) return
+    const seeded = seedState !== 'loading' && (seedPasses > wait.pass || loc.source === 'manual')
+    if (!seeded && !wait.expired) return
     autoSelectDone.current = true
     let nearest = visible[0]
     let best = Infinity
@@ -376,12 +488,27 @@ export default function HomePage() {
     const map = mapRef.current
     const at: [number, number] = [nearest.data.longitude, nearest.data.latitude]
     if (map && !map.getBounds().contains(at)) map.easeTo({ center: at })
-  }, [userLocation, mapReady, recordsStatus, initialSeedSettled, visible])
+  }, [
+    userLocation,
+    locationKey,
+    loc.source,
+    mapReady,
+    selectedId,
+    recordsStatus,
+    visible,
+    autoSelectWait,
+    seedState,
+    seedPasses,
+  ])
 
   // Escape closes the panel.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') select(null)
+      if (e.key !== 'Escape') return
+      if (pickingRef.current) {
+        setPicking(false)
+        setPickError(null)
+      } else select(null)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -391,7 +518,7 @@ export default function HomePage() {
     const next = new Set(set)
     if (next.has(value)) next.delete(value)
     else next.add(value)
-    autoSelectDone.current = true
+    markInteraction()
     update(next)
     // A filter that hides the selected restroom also closes its panel.
     const hidden = selected && (selected.data.kind === value || selected.data.genderType === value)
@@ -450,13 +577,22 @@ export default function HomePage() {
           )}
         </section>
 
-        {(locationNote === 'denied' || locationNote === 'outside-us') && (
-          <p className="pointer-events-auto rounded-md bg-card/95 px-3 py-2 text-xs text-muted-foreground shadow-card">
-            {locationNote === 'denied'
-              ? 'Location unavailable. Showing Los Angeles.'
-              : 'You appear to be outside the US. Showing Los Angeles.'}
-          </p>
-        )}
+        <LocationControl
+          loc={loc}
+          picking={picking}
+          pickError={pickError}
+          onStartPick={() => {
+            setPickError(null)
+            setPicking(true)
+          }}
+          onCancelPick={() => {
+            setPickError(null)
+            setPicking(false)
+          }}
+          onRecenter={() => {
+            if (loc.gps) mapRef.current?.easeTo({ center: [loc.gps.longitude, loc.gps.latitude] })
+          }}
+        />
       </div>
 
       {selected && (
