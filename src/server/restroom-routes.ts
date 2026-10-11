@@ -19,7 +19,8 @@
 import type { Hono } from 'hono'
 import { resolveAppRole } from 'deepspace/worker'
 import type { ActionTools } from 'deepspace/worker'
-import { cellFromKey, cellTouchesUS, type Cell } from '../lib/us-geo.js'
+import { cellForPoint, cellFromKey, cellTouchesUS, type Cell } from '../lib/us-geo.js'
+import { normalizeRestroom } from '../schemas/restrooms-schema.js'
 import type { GenderType, Restroom, RestroomStatus, Wheelchair } from '../schemas/restrooms-schema.js'
 import { createActionTools } from './action-routes.js'
 import { resolveAuth } from './http-routes.js'
@@ -134,7 +135,7 @@ function toRestroom(el: OverpassElement): { recordId: string; data: Restroom } |
   const brand = isToilet ? undefined : tags.brand
   return {
     recordId: `osm-${el.type}-${el.id}`,
-    data: {
+    data: normalizeRestroom({
       name: tags.name ?? brand ?? 'Public restroom',
       latitude,
       longitude,
@@ -145,7 +146,8 @@ function toRestroom(el: OverpassElement): { recordId: string; data: Restroom } |
       source: 'osm',
       osmId: `${el.type}/${el.id}`,
       status: 'active',
-    },
+      cellKey: cellForPoint(latitude, longitude).key,
+    }),
   }
 }
 
