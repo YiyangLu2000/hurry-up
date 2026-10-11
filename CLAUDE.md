@@ -18,6 +18,14 @@ restructuring it, but do not build anything from phases 2 to 4 until asked.
    changes the restroom's status: a pending submission becomes active, or
    an existing restroom becomes unavailable. Restrooms are never deleted.
    Counting happens on the server.
+   - Status changes do not reach maps that are already open: in SDK 0.39.3
+     the server only broadcasts an update to sockets that can read the
+     record's *new* value, so a visitor who loses access (active →
+     unavailable) is sent nothing and keeps the stale marker until reload.
+     Before phase 3 ships, re-subscribe the visible cells periodically
+     (and on tab refocus) so status changes reach open maps. Reported to
+     DeepSpace as a docs/SDK mismatch (docs: concepts/realtime-sync,
+     "Permissions on the wire").
 4. **Membership:** a paid subscription through DeepSpace payments. Only
    members can see which restrooms are top rated (5 stars). The gate must
    be enforced by server-side permissions, not hidden in the UI.
