@@ -6,6 +6,8 @@
 import { isInUSOutline } from './us-outline'
 
 export type Point = { latitude: number; longitude: number }
+/** A location the user set: tapped on the map, or typed (with what they chose). */
+export type ManualLocation = Point & { label?: string }
 
 export type BrowserFamily =
   | 'ios'
@@ -82,19 +84,21 @@ export function blockedLocationSteps(userAgent: string, maxTouchPoints = 0): str
 const MANUAL_KEY = 'hurry-up:manual-location'
 
 /** The location set on the map this session; null when absent or unusable. */
-export function loadManualLocation(): Point | null {
+export function loadManualLocation(): ManualLocation | null {
   try {
     const raw = sessionStorage.getItem(MANUAL_KEY)
     if (!raw) return null
-    const p = JSON.parse(raw) as Partial<Point>
+    const p = JSON.parse(raw) as Partial<ManualLocation>
     if (typeof p.latitude !== 'number' || typeof p.longitude !== 'number') return null
-    return isInUSOutline(p.latitude, p.longitude) ? { latitude: p.latitude, longitude: p.longitude } : null
+    if (!isInUSOutline(p.latitude, p.longitude)) return null
+    const label = typeof p.label === 'string' ? p.label : undefined
+    return { latitude: p.latitude, longitude: p.longitude, ...(label ? { label } : {}) }
   } catch {
     return null
   }
 }
 
-export function saveManualLocation(p: Point | null): void {
+export function saveManualLocation(p: ManualLocation | null): void {
   try {
     if (p) sessionStorage.setItem(MANUAL_KEY, JSON.stringify(p))
     else sessionStorage.removeItem(MANUAL_KEY)

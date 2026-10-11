@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { isInUSOutline } from './us-outline'
-import { loadManualLocation, saveManualLocation, type Point } from './location'
+import { loadManualLocation, saveManualLocation, type ManualLocation, type Point } from './location'
 
 /** 'unknown': the browser cannot report permission and we have not asked yet. */
 export type LocationPermission = 'granted' | 'denied' | 'prompt' | 'unknown'
@@ -18,7 +18,7 @@ export function useUserLocation() {
   const [permission, setPermission] = useState<LocationPermission>('unknown')
   const [gps, setGps] = useState<Point | null>(null)
   const [gpsStatus, setGpsStatus] = useState<GpsStatus>('idle')
-  const [manual, setManualState] = useState<Point | null>(() => loadManualLocation())
+  const [manual, setManualState] = useState<ManualLocation | null>(() => loadManualLocation())
   // The first location attempt has finished (or there will not be one).
   const [settled, setSettled] = useState(false)
   const statusRef = useRef<PermissionStatus | null>(null)
@@ -92,7 +92,7 @@ export function useUserLocation() {
     }
   }, [request])
 
-  const setManual = useCallback((p: Point) => {
+  const setManual = useCallback((p: ManualLocation) => {
     setManualState(p)
     saveManualLocation(p)
   }, [])

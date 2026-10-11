@@ -6,10 +6,12 @@
  * tapping the map.
  */
 
-import { useState } from 'react'
-import { Locate, LocateFixed, LocateOff, MapPinned, X } from 'lucide-react'
+import { useState, type FormEvent } from 'react'
+import { Locate, LocateFixed, LocateOff, MapPinned, Search, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { blockedLocationSteps } from '../lib/location'
+import { GEOCODER_ATTRIBUTION, parseCoordinates, searchPlaces, type Place } from '../lib/geocode'
+import { isInUSOutline } from '../lib/us-outline'
 import type { UserLocation } from '../lib/use-user-location'
 
 type Props = {
@@ -17,6 +19,8 @@ type Props = {
   picking: boolean
   pickError: string | null
   onStartPick: () => void
+  /** A typed place or coordinates was chosen (already checked to be in the US). */
+  onChoosePlace: (place: Place) => void
   onCancelPick: () => void
   onRecenter: () => void
 }
@@ -39,13 +43,25 @@ const buttonClass =
 const secondaryClass =
   'rounded-md border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted'
 
-export function LocationControl({ loc, picking, pickError, onStartPick, onCancelPick, onRecenter }: Props) {
+export function LocationControl({
+  loc,
+  picking,
+  pickError,
+  onStartPick,
+  onChoosePlace,
+  onCancelPick,
+  onRecenter,
+}: Props) {
   const [open, setOpen] = useState(false)
   const { text, Icon } = chipLabel(loc)
   // Picking needs the map clear; the panel stays closed afterwards.
   const startPick = () => {
     setOpen(false)
     onStartPick()
+  }
+  const choosePlace = (place: Place) => {
+    setOpen(false)
+    onChoosePlace(place)
   }
 
   if (picking) {
@@ -84,7 +100,7 @@ export function LocationControl({ loc, picking, pickError, onStartPick, onCancel
       {open && (
         <section
           data-testid="location-panel"
-          className="w-full rounded-lg border border-border bg-card p-3 text-sm text-card-foreground shadow-card"
+          className="max-h-[60vh] w-full overflow-y-auto rounded-lg border border-border bg-card p-3 text-sm text-card-foreground shadow-card"
         >
           <div className="mb-2 flex items-start justify-between gap-2">
             <h2 className="text-sm font-semibold">Your location</h2>
@@ -100,27 +116,7 @@ export function LocationControl({ loc, picking, pickError, onStartPick, onCancel
 
           <PermissionSection loc={loc} onRecenter={onRecenter} />
 
-          <div className="mt-3 border-t border-border pt-3">
-            {loc.manual ? (
-              <>
-                <p className="mb-2 text-xs text-muted-foreground">
-                  Using a location you set on the map{loc.gps ? ' instead of your device location' : ''}.
-                </p>
-                <div className="flex gap-2">
-                  <button type="button" onClick={startPick} className={secondaryClass}>
-                    Move it
-                  </button>
-                  <button type="button" data-testid="clear-manual" onClick={loc.clearManual} className={secondaryClass}>
-                    Clear
-                  </button>
-                </div>
-              </>
-            ) : (
-              <button type="button" data-testid="start-pick" onClick={startPick} className={secondaryClass}>
-                Set my location on the map
-              </button>
-            )}
-          </div>
+          <ManualSection loc={loc} onStartPick={startPick} onChoosePlace={choosePlace} />
         </section>
       )}
     </div>
@@ -189,6 +185,134 @@ function PermissionSection({ loc, onRecenter }: { loc: UserLocation; onRecenter:
         className={buttonClass}
       >
         Use my location
+      </button>
+    </div>
+  )
+}
+
+/**
+ * Setting a location yourself, available whatever the permission state:
+ * type an address, place, or "lat, lng", or tap the map.
+ */
+function ManualSection({
+  loc,
+  onStartPick,
+  onChoosePlace,
+}: {
+  loc: UserLocation
+  onStartPick: () => void
+  onChoosePlace: (place: Place) => void
+}) {
+  const [query, setQuery] = useState('')
+  const [results, setResults] = useState<Place[] | null>(null)
+  const [status, setStatus] = useState<'idle' | 'searching' | 'error'>('idle')
+  const [message, setMessage] = useState<string | null>(null)
+
+  // One request per submit (never as-you-type), per the geocoder's policy.
+  const submit = async (e: FormEvent) => {
+    e.preventDefault()
+    const text = query.trim()
+    if (!text || status === 'searching') return
+    setMessage(null)
+    setResults(null)
+    const coords = parseCoordinates(text)
+    if (coords) {
+      if (isInUSOutline(coords.latitude, coords.longitude)) {
+        onChoosePlace({ ...coords, label: `${coords.latitude}, ${coords.longitude}` })
+      } else {
+        setMessage('Those coordinates are outside the US.')
+      }
+      return
+    }
+    setStatus('searching')
+    try {
+      const places = await searchPlaces(text)
+      setStatus('idle')
+      if (places.length === 0) setMessage('No US places found. Try adding a city or ZIP code.')
+      else setResults(places)
+    } catch {
+      setStatus('error')
+      setMessage('Search is unavailable right now. You can tap the map instead.')
+    }
+  }
+
+  return (
+    <div className="mt-3 border-t border-border pt-3">
+      <p className="mb-2 text-xs font-medium">
+        {loc.permission === 'granted' && loc.gpsStatus === 'ok'
+          ? 'Somewhere else? Set your location yourself'
+          : 'Set your location yourself'}
+      </p>
+
+      {loc.manual && (
+        <div className="mb-2 flex items-start justify-between gap-2 rounded-md bg-muted px-2.5 py-1.5 text-xs">
+          <span data-testid="manual-label" className="min-w-0">
+            Using {loc.manual.label ? <strong className="break-words">{loc.manual.label}</strong> : 'a point you set on the map'}
+            {loc.gps ? ' instead of your device location' : ''}.
+          </span>
+          <button
+            type="button"
+            data-testid="clear-manual"
+            onClick={loc.clearManual}
+            className="shrink-0 font-medium underline underline-offset-2"
+          >
+            Clear
+          </button>
+        </div>
+      )}
+
+      <form onSubmit={submit} className="flex gap-2" role="search">
+        <input
+          data-testid="place-input"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Address, place, or lat, lng"
+          aria-label="Type your location"
+          autoComplete="off"
+          className="min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+        />
+        <button
+          type="submit"
+          data-testid="place-search"
+          disabled={!query.trim() || status === 'searching'}
+          className={cn(secondaryClass, 'inline-flex items-center gap-1 px-2.5')}
+        >
+          <Search className="h-3.5 w-3.5" />
+          {status === 'searching' ? 'Searching…' : 'Search'}
+        </button>
+      </form>
+
+      {message && (
+        <p data-testid="place-message" className="mt-2 text-xs text-muted-foreground">
+          {message}
+        </p>
+      )}
+
+      {results && (
+        <div className="mt-2">
+          <ul data-testid="place-results" className="max-h-40 space-y-1 overflow-y-auto">
+            {results.map((p) => (
+              <li key={`${p.latitude},${p.longitude}`}>
+                <button
+                  type="button"
+                  onClick={() => onChoosePlace(p)}
+                  className="w-full rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted"
+                >
+                  {p.label}
+                </button>
+              </li>
+            ))}
+          </ul>
+          <p
+            className="mt-1 text-[10px] text-muted-foreground [&_a]:underline"
+            // Attribution required by the geocoder's usage policy.
+            dangerouslySetInnerHTML={{ __html: GEOCODER_ATTRIBUTION }}
+          />
+        </div>
+      )}
+
+      <button type="button" data-testid="start-pick" onClick={onStartPick} className={cn(secondaryClass, 'mt-2')}>
+        {loc.manual ? 'Tap the map instead' : 'Tap the map where you are'}
       </button>
     </div>
   )

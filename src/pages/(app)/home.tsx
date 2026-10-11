@@ -8,6 +8,10 @@
  *
  * The visitor's location is GPS (when allowed) or a point they set on the map;
  * either one drives the user dot, distances, and the closest-restroom pick.
+ *
+ * Selecting a restroom requests a walking or driving route to it. The route to
+ * the last selected restroom stays on the map after its panel closes, until
+ * another restroom is selected or the route is cleared (memory only).
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -19,7 +23,7 @@ import type {
 } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { getAuthToken, useAuthProfileReady, useQuery } from 'deepspace'
-import { Accessibility, Car, Footprints, Info, MapPin, Utensils, X } from 'lucide-react'
+import { Accessibility, Car, Footprints, Info, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LocationControl } from '../../components/LocationControl'
 import {
@@ -31,14 +35,23 @@ import {
   saveMapsProvider,
   walkingMinutes,
   type MapsProvider,
+  type TravelMode,
 } from '../../lib/directions'
+import {
+  fetchRoute,
+  formatDuration,
+  routeKey,
+  ROUTING_ATTRIBUTION,
+  type LineCoords,
+  type Route,
+} from '../../lib/routing'
 import {
   cellsInView,
   DEFAULT_CENTER,
   MIN_SEED_ZOOM,
   US_MAX_BOUNDS,
 } from '../../lib/us-geo'
-import type { Point } from '../../lib/location'
+import type { ManualLocation, Point } from '../../lib/location'
 import { isInUSOutline } from '../../lib/us-outline'
 import { useUserLocation } from '../../lib/use-user-location'
 import {
@@ -57,13 +70,24 @@ const SEED_BACKOFF_MAX_MS = 10 * 60_000
 const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c' }
 const UNAVAILABLE_COLOR = '#9ca3af'
 const AUTO_SELECT_WAIT_MS = 5000
+/** Auto-select only picks a restroom this close; farther is not "nearby". */
+const AUTO_SELECT_MAX_METERS = 5000
 /** Seeding waits this long for the first location answer before using the default city. */
 const SEED_LOCATION_WAIT_MS = 6000
 /** The selected marker's halo when not pulsing (reduced motion). */
 const HALO_REST = { radius: 24, opacity: 0.5 }
 /** Hit area around a click, so small markers are easy to tap. */
 const CLICK_TOLERANCE_PX = 8
-const MARKER_LAYERS = ['restroom-selected', 'restrooms']
+const MARKER_LAYERS = ['restroom-selected', 'restroom-destination', 'restrooms']
+const ROUTE_COLOR = '#2563eb'
+/** Beyond this straight-line distance no route is requested (heavy for the service). */
+const MAX_ROUTE_METERS = 50_000
+/**
+ * Moving your location further than this starts fresh: the old selection and
+ * route (chosen for the old spot) are dropped so the map centres on the new
+ * one. Smaller corrections keep them.
+ */
+const RELOCATE_RESET_METERS = 300
 const markerColor = [
   'case',
   ['!=', ['get', 'status'], 'active'],
@@ -122,12 +146,57 @@ export default function HomePage() {
   const userMarkerRef = useRef<MapLibreMarker | null>(null)
   const [mapReady, setMapReady] = useState(false)
 
+  // Routing. The route target is the last selected restroom; it outlives the
+  // panel. `route` is what is drawn: a real route, or a straight fallback.
+  const [routeTargetId, setRouteTargetId] = useState<string | null>(null)
+  const [travelMode, setTravelMode] = useState<TravelMode>('walk')
+  const [route, setRoute] = useState<{
+    key: string
+    targetId: string
+    mode: TravelMode
+    result: Route | { kind: 'fallback'; coordinates: LineCoords }
+  } | null>(null)
+  const [routePending, setRoutePending] = useState(false)
+
   const visible = useMemo(
     () =>
       records.filter((r) => kinds.has(r.data.kind) && genders.has(r.data.genderType ?? 'unknown')),
     [records, kinds, genders],
   )
   const selected = records.find((r) => r.recordId === selectedId) ?? null
+  const routeTarget = records.find((r) => r.recordId === routeTargetId) ?? null
+  const routeTargetIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    routeTargetIdRef.current = routeTargetId
+  })
+
+  /**
+   * Set the visitor's location by hand (map tap or typed). The map moves to
+   * it at a zoom where restrooms load, so the ones around it appear. A real
+   * move (or one with no route showing) starts over: the old selection and
+   * route go, and the closest restroom to the new spot is selected and
+   * routed to once the restrooms around it have loaded.
+   */
+  const setManual = loc.setManual
+  const setManualLocation = useCallback(
+    (p: ManualLocation) => {
+      const previous = locationRef.current
+      const moved = !previous || distanceMeters(p, previous) > RELOCATE_RESET_METERS
+      if (moved || !routeTargetIdRef.current) {
+        setRouteTargetId(null)
+        setSelectedId(null)
+        autoSelectDone.current = false
+      }
+      setManual(p)
+      // Arriving there fires moveend, which seeds the cells around it.
+      mapRef.current?.easeTo({
+        center: [p.longitude, p.latitude],
+        zoom: Math.max(START_ZOOM, MIN_SEED_ZOOM),
+        duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 800,
+      })
+    },
+    [setManual],
+  )
 
   /** User interaction ends the auto-select window, once a location is known. */
   const markInteraction = useCallback(() => {
@@ -245,7 +314,7 @@ export default function HomePage() {
         center: [center.longitude, center.latitude],
         zoom: START_ZOOM,
         maxBounds: US_MAX_BOUNDS,
-        attributionControl: { compact: true },
+        attributionControl: { compact: true, customAttribution: ROUTING_ATTRIBUTION },
       })
       mapRef.current = map
       map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-right')
@@ -265,6 +334,55 @@ export default function HomePage() {
             'circle-color': markerColor,
             'circle-stroke-width': ['match', ['get', 'kind'], 'restaurant', 1.5, 3],
             'circle-stroke-color': '#ffffff',
+          },
+        })
+        // Route line under every marker: a white casing, then a solid line for a
+        // real route or a dashed one for the straight-line fallback.
+        map.addSource('route', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
+        map.addLayer(
+          {
+            id: 'route-casing',
+            type: 'line',
+            source: 'route',
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: { 'line-color': '#ffffff', 'line-width': 8, 'line-opacity': 0.9 },
+          },
+          'restrooms',
+        )
+        map.addLayer(
+          {
+            id: 'route-line',
+            type: 'line',
+            source: 'route',
+            filter: ['==', ['get', 'kind'], 'route'],
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: { 'line-color': ROUTE_COLOR, 'line-width': 5 },
+          },
+          'restrooms',
+        )
+        map.addLayer(
+          {
+            id: 'route-fallback',
+            type: 'line',
+            source: 'route',
+            filter: ['==', ['get', 'kind'], 'fallback'],
+            layout: { 'line-cap': 'butt' },
+            paint: { 'line-color': ROUTE_COLOR, 'line-width': 4, 'line-dasharray': [1.5, 1.5] },
+          },
+          'restrooms',
+        )
+        // The end of a route whose panel is closed: a ring in the restroom's
+        // colour, quieter than the selected glow.
+        map.addLayer({
+          id: 'restroom-destination',
+          type: 'circle',
+          source: 'restrooms',
+          filter: ['==', ['get', 'id'], ''],
+          paint: {
+            'circle-radius': 9,
+            'circle-color': '#ffffff',
+            'circle-stroke-width': 4,
+            'circle-stroke-color': markerColor,
           },
         })
         // The selected marker is drawn by these two layers (filtered to its id)
@@ -305,7 +423,7 @@ export default function HomePage() {
             }
             setPickError(null)
             setPicking(false)
-            loc.setManual({ latitude: lat, longitude: lng })
+            setManualLocation({ latitude: lat, longitude: lng })
             return
           }
           const { x, y } = e.point
@@ -358,7 +476,7 @@ export default function HomePage() {
       mapRef.current = null
     }
     // loc.setManual is a stable callback; the map is created once.
-  }, [seedView, select, markInteraction])
+  }, [seedView, select, markInteraction, setManualLocation])
 
   // Open seeding once the first location answer is in.
   useEffect(() => {
@@ -435,7 +553,10 @@ export default function HomePage() {
     const map = mapReady ? mapRef.current : null
     if (!map) return
     const id = selectedId ?? ''
-    map.setFilter('restrooms', ['!=', ['get', 'id'], id])
+    // The destination ring shows only while its restroom is not selected.
+    const dest = routeTargetId && routeTargetId !== selectedId && route ? routeTargetId : ''
+    map.setFilter('restrooms', ['all', ['!=', ['get', 'id'], id], ['!=', ['get', 'id'], dest]])
+    map.setFilter('restroom-destination', ['==', ['get', 'id'], dest])
     map.setFilter('restroom-halo', ['==', ['get', 'id'], id])
     map.setFilter('restroom-selected', ['==', ['get', 'id'], id])
     if (!selectedId || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
@@ -451,7 +572,107 @@ export default function HomePage() {
       frame = requestAnimationFrame(pulse)
     })
     return () => cancelAnimationFrame(frame)
-  }, [selectedId, mapReady])
+  }, [selectedId, routeTargetId, route, mapReady])
+
+  // A selection becomes the route target; closing the panel keeps the target.
+  useEffect(() => {
+    if (selectedId) setRouteTargetId(selectedId)
+  }, [selectedId])
+
+  // Request the route: one request per target, travel mode, or location,
+  // cancelled when any of them changes. Failure or timeout → dashed fallback.
+  const fromLat = userLocation?.latitude
+  const fromLng = userLocation?.longitude
+  const toLat = routeTarget?.data.latitude
+  const toLng = routeTarget?.data.longitude
+  const fitPending = useRef(false)
+  useEffect(() => {
+    if (!routeTargetId || fromLat === undefined || fromLng === undefined) {
+      setRoute(null)
+      setRoutePending(false)
+      return
+    }
+    if (toLat === undefined || toLng === undefined) return
+    const from = { latitude: fromLat, longitude: fromLng }
+    const to = { latitude: toLat, longitude: toLng }
+    const key = routeKey(travelMode, from, to)
+    const controller = new AbortController()
+    setRoutePending(true)
+    const request =
+      distanceMeters(from, to) > MAX_ROUTE_METERS
+        ? Promise.resolve(null) // too far to route: straight line, no request
+        : fetchRoute(travelMode, from, to, controller.signal)
+    request
+      .then((result) => {
+        fitPending.current = true
+        setRoute({
+          key,
+          targetId: routeTargetId,
+          mode: travelMode,
+          result: result ?? {
+            kind: 'fallback',
+            coordinates: [
+              [fromLng, fromLat],
+              [toLng, toLat],
+            ],
+          },
+        })
+        setRoutePending(false)
+      })
+      .catch(() => {
+        // Aborted: a newer request owns the state.
+      })
+    return () => controller.abort()
+  }, [routeTargetId, travelMode, fromLat, fromLng, toLat, toLng])
+
+  // Draw the route, and fit it into view when a new one arrives. Closing the
+  // panel does not produce a new route, so it never moves the map.
+  useEffect(() => {
+    const map = mapReady ? mapRef.current : null
+    if (!map) return
+    const line = (coordinates: LineCoords, kind: 'route' | 'fallback') => ({
+      type: 'Feature' as const,
+      geometry: { type: 'LineString' as const, coordinates },
+      properties: { kind },
+    })
+    const features = route ? [line(route.result.coordinates, route.result.kind)] : []
+    // A real route starts and ends on the nearest road; dashed connectors
+    // join it to the visitor and the restroom when the gap is noticeable.
+    if (route?.result.kind === 'route' && userLocation && routeTarget) {
+      const coords = route.result.coordinates
+      const ends: [Point, [number, number]][] = [
+        [userLocation, coords[0]],
+        [routeTarget.data, coords[coords.length - 1]],
+      ]
+      for (const [p, [lng, lat]] of ends) {
+        if (distanceMeters(p, { latitude: lat, longitude: lng }) > 10) {
+          features.push(line([[p.longitude, p.latitude], [lng, lat]], 'fallback'))
+        }
+      }
+    }
+    map.getSource<GeoJSONSource>('route')?.setData({ type: 'FeatureCollection', features })
+    if (!route || !fitPending.current) return
+    fitPending.current = false
+    const coords = route.result.coordinates
+    const lngs = coords.map((c) => c[0])
+    const lats = coords.map((c) => c[1])
+    const wide = window.innerWidth >= 640
+    map.fitBounds(
+      [
+        [Math.min(...lngs), Math.min(...lats)],
+        [Math.max(...lngs), Math.max(...lats)],
+      ],
+      {
+        // Keep the line clear of the filter column and the details panel.
+        padding: wide
+          ? { top: 60, right: 60, bottom: 60, left: 430 }
+          : { top: 300, right: 30, bottom: 340, left: 30 },
+        maxZoom: 17,
+        duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 600,
+      },
+    )
+    // userLocation/routeTarget only shape the connectors; a new route is what fits.
+  }, [route, mapReady, userLocation, routeTarget])
 
   // Auto-select the nearest matching restroom, once per page load, when a
   // location (GPS or set on the map) becomes known. It waits for a seeding
@@ -472,9 +693,10 @@ export default function HomePage() {
     if (recordsStatus !== 'ready' || visible.length === 0) return
     const wait = autoSelectWait
     if (!wait || wait.key !== locationKey) return
-    const seeded = seedState !== 'loading' && (seedPasses > wait.pass || loc.source === 'manual')
+    // A seeding pass that finished after the location was set (or the timeout):
+    // judging "closest" earlier could miss restrooms still loading nearby.
+    const seeded = seedState !== 'loading' && seedPasses > wait.pass
     if (!seeded && !wait.expired) return
-    autoSelectDone.current = true
     let nearest = visible[0]
     let best = Infinity
     for (const r of visible) {
@@ -484,6 +706,10 @@ export default function HomePage() {
         nearest = r
       }
     }
+    // Nothing nearby loaded yet: keep waiting for seeding (or until the user
+    // interacts) rather than selecting something across the country.
+    if (best > AUTO_SELECT_MAX_METERS) return
+    autoSelectDone.current = true
     setSelectedId(nearest.recordId)
     const map = mapRef.current
     const at: [number, number] = [nearest.data.longitude, nearest.data.latitude]
@@ -491,7 +717,6 @@ export default function HomePage() {
   }, [
     userLocation,
     locationKey,
-    loc.source,
     mapReady,
     selectedId,
     recordsStatus,
@@ -534,7 +759,8 @@ export default function HomePage() {
         <div ref={containerRef} className="h-full w-full" data-testid="restroom-map" />
       </div>
 
-      <div className="pointer-events-none absolute inset-x-3 top-3 flex flex-col gap-2 sm:right-auto sm:w-80">
+      {/* Above the details panel: an open location panel must stay usable. */}
+      <div className="pointer-events-none absolute inset-x-3 top-3 z-20 flex flex-col gap-2 sm:right-auto sm:w-80">
         <section className="pointer-events-auto rounded-lg border border-border bg-card/95 p-3 text-card-foreground shadow-card backdrop-blur">
           <FilterRow label="Type">
             {RESTROOM_KINDS.map((k) => (
@@ -585,6 +811,11 @@ export default function HomePage() {
             setPickError(null)
             setPicking(true)
           }}
+          onChoosePlace={(place) => {
+            setPickError(null)
+            setPicking(false)
+            setManualLocation(place)
+          }}
           onCancelPick={() => {
             setPickError(null)
             setPicking(false)
@@ -593,6 +824,18 @@ export default function HomePage() {
             if (loc.gps) mapRef.current?.easeTo({ center: [loc.gps.longitude, loc.gps.latitude] })
           }}
         />
+
+        {route && (
+          <button
+            type="button"
+            data-testid="clear-route"
+            onClick={() => setRouteTargetId(null)}
+            className="pointer-events-auto inline-flex items-center gap-1.5 self-start rounded-full border border-border bg-card/95 px-3 py-1.5 text-xs font-medium text-card-foreground shadow-card backdrop-blur"
+          >
+            <RouteIcon className="h-3.5 w-3.5" />
+            Clear route
+          </button>
+        )}
       </div>
 
       {selected && (
@@ -600,6 +843,18 @@ export default function HomePage() {
           id={selected.recordId}
           restroom={selected.data}
           userLocation={userLocation}
+          travelMode={travelMode}
+          onTravelModeChange={(mode) => {
+            setTravelMode(mode)
+            // Also brings the route back if it was cleared with the panel open.
+            setRouteTargetId(selected.recordId)
+          }}
+          route={
+            route && route.targetId === selected.recordId && route.mode === travelMode
+              ? route.result
+              : null
+          }
+          routePending={routePending}
           canToggleStatus={isAdmin && import.meta.env.DEV}
           onClose={() => select(null)}
         />
@@ -652,12 +907,20 @@ function RestroomDetails({
   id,
   restroom,
   userLocation,
+  travelMode,
+  onTravelModeChange,
+  route,
+  routePending,
   canToggleStatus,
   onClose,
 }: {
   id: string
   restroom: Restroom
   userLocation: { latitude: number; longitude: number } | null
+  travelMode: TravelMode
+  onTravelModeChange: (mode: TravelMode) => void
+  route: Route | { kind: 'fallback' } | null
+  routePending: boolean
   canToggleStatus: boolean
   onClose: () => void
 }) {
@@ -686,7 +949,7 @@ function RestroomDetails({
   return (
     <section
       data-testid="restroom-details"
-      className="absolute inset-x-3 bottom-3 rounded-lg border border-border bg-card p-4 text-card-foreground shadow-card sm:left-3 sm:right-auto sm:w-96"
+      className="absolute inset-x-3 bottom-3 z-10 rounded-lg border border-border bg-card p-4 text-card-foreground shadow-card sm:left-3 sm:right-auto sm:w-96"
     >
       <div className="flex items-start justify-between gap-3">
         <div>
@@ -724,7 +987,14 @@ function RestroomDetails({
         </p>
       )}
 
-      <Directions restroom={restroom} userLocation={userLocation} />
+      <Directions
+        restroom={restroom}
+        userLocation={userLocation}
+        travelMode={travelMode}
+        onTravelModeChange={onTravelModeChange}
+        route={route}
+        routePending={routePending}
+      />
 
       {canToggleStatus && (
         <div className="mt-3 border-t border-border pt-3 text-xs">
@@ -752,9 +1022,17 @@ const APPLE_DEVICE = typeof navigator !== 'undefined' && isAppleDevice(navigator
 function Directions({
   restroom,
   userLocation,
+  travelMode,
+  onTravelModeChange,
+  route,
+  routePending,
 }: {
   restroom: Restroom
   userLocation: { latitude: number; longitude: number } | null
+  travelMode: TravelMode
+  onTravelModeChange: (mode: TravelMode) => void
+  route: Route | { kind: 'fallback' } | null
+  routePending: boolean
 }) {
   const [provider, setProvider] = useState<MapsProvider>(() =>
     APPLE_DEVICE ? (loadMapsProvider() ?? 'apple') : 'google',
@@ -772,12 +1050,51 @@ function Directions({
   return (
     <div className="mt-3 border-t border-border pt-3">
       {meters !== null && (
-        <p data-testid="restroom-distance" className="mb-2 text-sm">
-          About {formatDistance(meters)} away · ~{walkingMinutes(meters)} min walk
-          <span className="block text-xs text-muted-foreground">
-            Approximate, in a straight line
-          </span>
-        </p>
+        <div className="mb-2">
+          <div
+            role="group"
+            aria-label="Route mode"
+            data-testid="route-mode"
+            className="mb-2 inline-flex rounded-md border border-border p-0.5 text-xs"
+          >
+            {(['walk', 'drive'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                aria-pressed={travelMode === m}
+                onClick={() => onTravelModeChange(m)}
+                className={cn(
+                  'inline-flex items-center gap-1 rounded px-2 py-1',
+                  travelMode === m ? 'bg-muted font-medium text-foreground' : 'text-muted-foreground',
+                )}
+              >
+                {m === 'walk' ? <Footprints className="h-3.5 w-3.5" /> : <Car className="h-3.5 w-3.5" />}
+                {m === 'walk' ? 'Walk' : 'Drive'}
+              </button>
+            ))}
+          </div>
+          {route?.kind === 'route' ? (
+            <p data-testid="restroom-distance" className="text-sm">
+              {formatDistance(route.distance)} · {formatDuration(route.duration)}{' '}
+              {travelMode === 'walk' ? 'walk' : 'drive'}
+              <span
+                className="block text-xs text-muted-foreground [&_a]:underline"
+                // Required by the routing service's usage policy.
+                dangerouslySetInnerHTML={{
+                  __html: `By ${travelMode === 'walk' ? 'walking' : 'driving'} route · ${ROUTING_ATTRIBUTION}`,
+                }}
+              />
+            </p>
+          ) : (
+            <p data-testid="restroom-distance" className="text-sm">
+              About {formatDistance(meters)} away
+              {travelMode === 'walk' && <> · ~{formatDuration(walkingMinutes(meters) * 60)} walk</>}
+              <span className="block text-xs text-muted-foreground">
+                {routePending && !route ? 'Finding a route… ' : ''}Approximate, in a straight line
+              </span>
+            </p>
+          )}
+        </div>
       )}
       <div className="flex flex-wrap items-center gap-2">
         <a
