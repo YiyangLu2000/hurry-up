@@ -8,11 +8,21 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { GeoJSONSource, Map as MapLibreMap } from 'maplibre-gl'
+import type { ExpressionSpecification, GeoJSONSource, Map as MapLibreMap } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { getAuthToken, useAuthProfileReady, useQuery } from 'deepspace'
-import { Accessibility, Info, MapPin, Utensils, X } from 'lucide-react'
+import { Accessibility, Car, Footprints, Info, MapPin, Utensils, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import {
+  directionsUrl,
+  distanceMeters,
+  formatDistance,
+  isAppleDevice,
+  loadMapsProvider,
+  saveMapsProvider,
+  walkingMinutes,
+  type MapsProvider,
+} from '../../lib/directions'
 import {
   cellsInView,
   DEFAULT_CENTER,
@@ -35,6 +45,18 @@ const SEED_BACKOFF_BASE_MS = 30_000
 const SEED_BACKOFF_MAX_MS = 10 * 60_000
 const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c' }
 const UNAVAILABLE_COLOR = '#9ca3af'
+const AUTO_SELECT_WAIT_MS = 5000
+/** The selected marker's halo when not pulsing (reduced motion). */
+const HALO_REST = { radius: 24, opacity: 0.5 }
+/** Hit area around a click, so small markers are easy to tap. */
+const CLICK_TOLERANCE_PX = 8
+const MARKER_LAYERS = ['restroom-selected', 'restrooms']
+const markerColor = [
+  'case',
+  ['!=', ['get', 'status'], 'active'],
+  UNAVAILABLE_COLOR,
+  ['match', ['get', 'kind'], 'restaurant', KIND_COLOR.restaurant, KIND_COLOR.public],
+] as ExpressionSpecification
 
 const GENDER_LABEL: Record<GenderType, string> = {
   men: 'Men',
@@ -65,14 +87,23 @@ function locate(): Promise<{ latitude: number; longitude: number } | 'denied' | 
 export default function HomePage() {
   const { user } = useAuthProfileReady({ requireUser: true })
   const isAdmin = user?.role === 'admin'
-  const { records } = useQuery<Restroom>('restrooms')
+  const { records, status: recordsStatus } = useQuery<Restroom>('restrooms')
 
   const [genders, setGenders] = useState<Set<GenderType>>(() => new Set(GENDER_TYPES))
   const [kinds, setKinds] = useState<Set<RestroomKind>>(() => new Set(RESTROOM_KINDS))
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [locationNote, setLocationNote] = useState<LocationNote>('locating')
   const [tooFarOut, setTooFarOut] = useState(false)
+  const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(
+    null,
+  )
   const [seedState, setSeedState] = useState<'idle' | 'loading' | 'error'>('idle')
+  // Auto-select waits for the first seeding pass over the visitor's cells (or
+  // a short timeout), so "nearest" is not judged before nearby rows arrive.
+  const [initialSeedSettled, setInitialSeedSettled] = useState(false)
+  // Once per page load: set after the auto-selection, or as soon as the user
+  // selects, closes, pans, or filters — whichever comes first.
+  const autoSelectDone = useRef(false)
 
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<MapLibreMap | null>(null)
@@ -84,6 +115,11 @@ export default function HomePage() {
     [records, kinds, genders],
   )
   const selected = records.find((r) => r.recordId === selectedId) ?? null
+
+  const select = useCallback((id: string | null) => {
+    autoSelectDone.current = true
+    setSelectedId(id)
+  }, [])
 
   // Seeding. A cell is requested until it succeeds (or is refused as outside
   // the US). A failure stops the batch — Overpass being down affects every
@@ -173,6 +209,7 @@ export default function HomePage() {
 
       const center = typeof located === 'object' ? located : DEFAULT_CENTER
       setLocationNote(typeof located === 'object' ? 'yours' : located)
+      if (typeof located === 'object') setUserLocation(located)
 
       map = new maplibregl.Map({
         container: containerRef.current,
@@ -202,28 +239,70 @@ export default function HomePage() {
           source: 'restrooms',
           paint: {
             'circle-radius': ['match', ['get', 'kind'], 'restaurant', 6, 8],
-            'circle-color': [
-              'case',
-              ['!=', ['get', 'status'], 'active'],
-              UNAVAILABLE_COLOR,
-              ['match', ['get', 'kind'], 'restaurant', KIND_COLOR.restaurant, KIND_COLOR.public],
-            ],
+            'circle-color': markerColor,
             'circle-stroke-width': ['match', ['get', 'kind'], 'restaurant', 1.5, 3],
             'circle-stroke-color': '#ffffff',
           },
         })
-        map.on('click', 'restrooms', (e) => {
-          const id = e.features?.[0]?.properties?.id
-          if (typeof id === 'string') setSelectedId(id)
+        // The selected marker is drawn by these two layers (filtered to its id)
+        // and excluded from the base layer: a soft halo under a larger dot.
+        map.addLayer({
+          id: 'restroom-halo',
+          type: 'circle',
+          source: 'restrooms',
+          filter: ['==', ['get', 'id'], ''],
+          paint: {
+            'circle-radius': HALO_REST.radius,
+            'circle-color': markerColor,
+            'circle-opacity': HALO_REST.opacity,
+            'circle-blur': 0.5,
+          },
         })
-        map.on('mouseenter', 'restrooms', () => {
-          if (map) map.getCanvas().style.cursor = 'pointer'
+        map.addLayer({
+          id: 'restroom-selected',
+          type: 'circle',
+          source: 'restrooms',
+          filter: ['==', ['get', 'id'], ''],
+          paint: {
+            'circle-radius': 12,
+            'circle-color': markerColor,
+            'circle-stroke-width': 3,
+            'circle-stroke-color': '#ffffff',
+          },
         })
-        map.on('mouseleave', 'restrooms', () => {
-          if (map) map.getCanvas().style.cursor = ''
+        // One click handler decides: a marker under the pointer selects it,
+        // empty map clears the selection.
+        map.on('click', (e) => {
+          if (!map) return
+          const { x, y } = e.point
+          const t = CLICK_TOLERANCE_PX
+          const hit = map.queryRenderedFeatures(
+            [
+              [x - t, y - t],
+              [x + t, y + t],
+            ],
+            { layers: MARKER_LAYERS },
+          )[0]
+          const id = hit?.properties?.id
+          select(typeof id === 'string' ? id : null)
         })
+        for (const layer of MARKER_LAYERS) {
+          map.on('mouseenter', layer, () => {
+            if (map) map.getCanvas().style.cursor = 'pointer'
+          })
+          map.on('mouseleave', layer, () => {
+            if (map) map.getCanvas().style.cursor = ''
+          })
+        }
         setMapReady(true)
-        void seedView()
+        const settle = () => setInitialSeedSettled(true)
+        setTimeout(settle, AUTO_SELECT_WAIT_MS)
+        void seedView().finally(settle)
+      })
+
+      // A user pan or zoom (not our own easeTo) ends the auto-select window.
+      map.on('movestart', (e) => {
+        if (e.originalEvent) autoSelectDone.current = true
       })
 
       map.on('moveend', () => {
@@ -241,7 +320,7 @@ export default function HomePage() {
       map?.remove()
       mapRef.current = null
     }
-  }, [seedView])
+  }, [seedView, select])
 
   // Push filtered records into the map source.
   useEffect(() => {
@@ -256,11 +335,67 @@ export default function HomePage() {
     })
   }, [visible, mapReady])
 
+  // Show the selection: base layer without it, halo and large dot with it.
+  useEffect(() => {
+    const map = mapReady ? mapRef.current : null
+    if (!map) return
+    const id = selectedId ?? ''
+    map.setFilter('restrooms', ['!=', ['get', 'id'], id])
+    map.setFilter('restroom-halo', ['==', ['get', 'id'], id])
+    map.setFilter('restroom-selected', ['==', ['get', 'id'], id])
+    if (!selectedId || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      map.setPaintProperty('restroom-halo', 'circle-radius', HALO_REST.radius)
+      map.setPaintProperty('restroom-halo', 'circle-opacity', HALO_REST.opacity)
+      return
+    }
+    // Gentle pulse: the halo breathes over ~1.6 s.
+    let frame = requestAnimationFrame(function pulse(time) {
+      const phase = (Math.sin((time / 1600) * 2 * Math.PI) + 1) / 2
+      map.setPaintProperty('restroom-halo', 'circle-radius', 20 + 10 * phase)
+      map.setPaintProperty('restroom-halo', 'circle-opacity', 0.7 - 0.35 * phase)
+      frame = requestAnimationFrame(pulse)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [selectedId, mapReady])
+
+  // Auto-select the nearest matching restroom, once, for a real location.
+  useEffect(() => {
+    if (autoSelectDone.current || !userLocation || !mapReady) return
+    if (recordsStatus !== 'ready' || !initialSeedSettled || visible.length === 0) return
+    autoSelectDone.current = true
+    let nearest = visible[0]
+    let best = Infinity
+    for (const r of visible) {
+      const d = distanceMeters(userLocation, r.data)
+      if (d < best) {
+        best = d
+        nearest = r
+      }
+    }
+    setSelectedId(nearest.recordId)
+    const map = mapRef.current
+    const at: [number, number] = [nearest.data.longitude, nearest.data.latitude]
+    if (map && !map.getBounds().contains(at)) map.easeTo({ center: at })
+  }, [userLocation, mapReady, recordsStatus, initialSeedSettled, visible])
+
+  // Escape closes the panel.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') select(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [select])
+
   const toggle = <T,>(set: Set<T>, value: T, update: (next: Set<T>) => void) => {
     const next = new Set(set)
     if (next.has(value)) next.delete(value)
     else next.add(value)
+    autoSelectDone.current = true
     update(next)
+    // A filter that hides the selected restroom also closes its panel.
+    const hidden = selected && (selected.data.kind === value || selected.data.genderType === value)
+    if (hidden && !next.has(value)) setSelectedId(null)
   }
 
   return (
@@ -328,8 +463,9 @@ export default function HomePage() {
         <RestroomDetails
           id={selected.recordId}
           restroom={selected.data}
+          userLocation={userLocation}
           canToggleStatus={isAdmin && import.meta.env.DEV}
-          onClose={() => setSelectedId(null)}
+          onClose={() => select(null)}
         />
       )}
     </div>
@@ -379,11 +515,13 @@ function Chip({
 function RestroomDetails({
   id,
   restroom,
+  userLocation,
   canToggleStatus,
   onClose,
 }: {
   id: string
   restroom: Restroom
+  userLocation: { latitude: number; longitude: number } | null
   canToggleStatus: boolean
   onClose: () => void
 }) {
@@ -450,6 +588,8 @@ function RestroomDetails({
         </p>
       )}
 
+      <Directions restroom={restroom} userLocation={userLocation} />
+
       {canToggleStatus && (
         <div className="mt-3 border-t border-border pt-3 text-xs">
           <p className="mb-2 text-muted-foreground">
@@ -467,5 +607,87 @@ function RestroomDetails({
         </div>
       )}
     </section>
+  )
+}
+
+/** Read once: the user agent does not change during a page view. */
+const APPLE_DEVICE = typeof navigator !== 'undefined' && isAppleDevice(navigator.userAgent)
+
+function Directions({
+  restroom,
+  userLocation,
+}: {
+  restroom: Restroom
+  userLocation: { latitude: number; longitude: number } | null
+}) {
+  const [provider, setProvider] = useState<MapsProvider>(() =>
+    APPLE_DEVICE ? (loadMapsProvider() ?? 'apple') : 'google',
+  )
+  const meters = userLocation ? distanceMeters(userLocation, restroom) : null
+
+  const choose = (next: MapsProvider) => {
+    setProvider(next)
+    saveMapsProvider(next)
+  }
+
+  const linkClass =
+    'inline-flex items-center justify-center gap-1.5 rounded-md bg-primary px-2.5 py-2 text-sm font-medium text-primary-foreground hover:opacity-90'
+
+  return (
+    <div className="mt-3 border-t border-border pt-3">
+      {meters !== null && (
+        <p data-testid="restroom-distance" className="mb-2 text-sm">
+          About {formatDistance(meters)} away · ~{walkingMinutes(meters)} min walk
+          <span className="block text-xs text-muted-foreground">
+            Approximate, in a straight line
+          </span>
+        </p>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <a
+          data-testid="directions-walk"
+          href={directionsUrl(provider, 'walk', restroom)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={linkClass}
+        >
+          <Footprints className="h-4 w-4" />
+          Walk
+        </a>
+        <a
+          data-testid="directions-drive"
+          href={directionsUrl(provider, 'drive', restroom)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className={linkClass}
+        >
+          <Car className="h-4 w-4" />
+          Drive
+        </a>
+        {APPLE_DEVICE && (
+          <div
+            role="group"
+            aria-label="Maps app"
+            data-testid="maps-provider-toggle"
+            className="ml-auto inline-flex rounded-md border border-border p-0.5 text-xs"
+          >
+            {(['apple', 'google'] as const).map((p) => (
+              <button
+                key={p}
+                type="button"
+                aria-pressed={provider === p}
+                onClick={() => choose(p)}
+                className={cn(
+                  'rounded px-1.5 py-1',
+                  provider === p ? 'bg-muted font-medium text-foreground' : 'text-muted-foreground',
+                )}
+              >
+                {p === 'apple' ? 'Apple Maps' : 'Google Maps'}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   )
 }
