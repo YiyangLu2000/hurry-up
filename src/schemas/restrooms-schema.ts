@@ -11,7 +11,7 @@
  * the whole collection. Every server write goes through `normalizeRestroom`.
  *
  * `restroom_areas` records which seeding-grid cells were fetched from
- * Overpass and when. It is invisible to every client.
+ * Overpass and when, or covered by the bulk import. Invisible to every client.
  */
 
 import type { CollectionSchema } from 'deepspace/schema'
@@ -97,6 +97,9 @@ export const restroomAreasSchema: CollectionSchema = {
     { name: 'cellKey', storage: 'text', interpretation: 'plain', required: true },
     { name: 'fetchedAt', storage: 'number', interpretation: 'plain', required: true },
     { name: 'resultCount', storage: 'number', interpretation: 'plain' },
+    // 'import' once the bulk import saved this cell's restrooms: live seeding
+    // then never asks Overpass for it again (no 7-day expiry).
+    { name: 'coveredBy', storage: 'text', interpretation: { kind: 'select', options: ['import'] } },
   ],
   uniqueOn: ['cellKey'],
   permissions: {

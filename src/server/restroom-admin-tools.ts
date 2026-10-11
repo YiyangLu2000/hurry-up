@@ -26,7 +26,7 @@ import type { ToolSet } from 'ai'
 import { z } from 'zod/v4'
 import { resolveAppRole } from 'deepspace/worker'
 import { toRestroom, type OverpassElement } from '../lib/osm-restrooms.js'
-import { cellForPoint } from '../lib/us-geo.js'
+import { cellForPoint, cellFromKey, cellTouchesUS } from '../lib/us-geo.js'
 import type { Restroom, RestroomStatus } from '../schemas/restrooms-schema.js'
 import { registerAgent } from '../ai/agent.js'
 import { createActionTools } from './action-routes.js'
@@ -38,6 +38,7 @@ import type { AppContext, Env } from '../../worker.js'
 const SEEDER_USER_ID = 'system:osm-seeder'
 /** Keeps one request under the agent route's 64 KB body cap with trimmed tags. */
 const MAX_ELEMENTS_PER_CALL = 300
+const MAX_CELLS_PER_CALL = 1000
 
 const requestScope = new AsyncLocalStorage<{ env: Env; userId: string | null }>()
 
@@ -74,6 +75,33 @@ export function buildRestroomAdminTools(): ToolSet {
           `[restrooms] import by ${userId}: received=${elements.length} mapped=${rows.length} created=${saved.created} skipped=${saved.skipped} failed=${saved.failed}`,
         )
         return { received: elements.length, rejected: elements.length - rows.length, ...saved }
+      },
+    }),
+
+    restrooms_mark_covered: tool({
+      description:
+        'Admin only. Mark grid cells as covered by the bulk import, so live seeding never asks Overpass for them again (no expiry). Call only after every restroom in these cells has been saved with restrooms_import. Safe to re-run.',
+      inputSchema: z.object({ cellKeys: z.array(z.string()).min(1).max(MAX_CELLS_PER_CALL) }),
+      execute: async ({ cellKeys }) => {
+        const { env, userId } = await requireAdmin()
+        const tools = createActionTools(env, SEEDER_USER_ID, '')
+        const now = Math.floor(Date.now() / 1000)
+        let marked = 0
+        let invalid = 0
+        let failed = 0
+        for (const key of new Set(cellKeys)) {
+          const cell = cellFromKey(key)
+          if (!cell || !cellTouchesUS(cell)) {
+            invalid++
+            continue
+          }
+          // Upsert by cellKey: keeps resultCount from any earlier live seed.
+          const res = await tools.create('restroom_areas', { cellKey: key, fetchedAt: now, coveredBy: 'import' }, key)
+          if (res.success) marked++
+          else failed++
+        }
+        console.info(`[restrooms] mark covered by ${userId}: marked=${marked} invalid=${invalid} failed=${failed}`)
+        return { marked, invalid, failed }
       },
     }),
 

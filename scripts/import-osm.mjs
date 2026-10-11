@@ -14,7 +14,9 @@
  *          `npx deepspace agent invoke` (your CLI login; you must be the app's
  *          admin). Finished batches are recorded in data/osm/progress.json and
  *          skipped on re-run; the server also skips existing restrooms, so a
- *          re-run never duplicates and never changes a status.
+ *          re-run never duplicates and never changes a status. After every
+ *          batch of a metro is saved, its grid cells are marked covered
+ *          (`restrooms_mark_covered`) so live seeding skips Overpass there.
  *
  * Filtering (US only, no private toilets, fast food needs a brand) happens on
  * the server with the same code as live seeding; this script only fetches.
@@ -48,6 +50,9 @@ const BACKOFF_MS = [10_000, 30_000, 60_000, 120_000]
 const KEEP_TAGS = ['amenity', 'name', 'brand', 'access', 'unisex', 'male', 'female', 'wheelchair', 'toilets:wheelchair']
 const BATCH_MAX_ELEMENTS = 200
 const BATCH_MAX_BYTES = 48 * 1024 // the agent route caps a request at 64 KB
+/** Seeding grid size; must match CELL_DEGREES in src/lib/us-geo.ts. */
+const CELL_DEGREES = 0.02
+const COVER_BATCH = 500
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a)
@@ -183,6 +188,35 @@ function batches(elements) {
   return out
 }
 
+/** Run an admin tool through the DeepSpace CLI; returns its result or throws. */
+async function invokeTool(app, tool, input) {
+  // The CLI reads input files only from inside the project.
+  const inputFile = join(DATA_DIR, '.batch.json')
+  await writeFile(inputFile, JSON.stringify(input))
+  const { stdout } = await run('npx', ['deepspace', 'agent', 'invoke', app, tool, '--input-file', inputFile, '--json'], {
+    maxBuffer: 1 << 20,
+  }).catch((err) => ({ stdout: err.stdout ?? '' }))
+  const line = stdout.trim().split('\n').filter((l) => l.startsWith('{')).pop() ?? ''
+  let result
+  try {
+    result = JSON.parse(line)
+  } catch {
+    throw new Error(`Unreadable CLI output for ${tool}: ${stdout.slice(0, 300)}`)
+  }
+  if (result.ok === false) throw new Error(`${tool} refused: ${JSON.stringify(result).slice(0, 300)}`)
+  return result.result ?? result.output ?? result
+}
+
+/** Grid cells lying entirely inside a bounding box (cells on its edge are only partly fetched). */
+function cellsInside([south, west, north, east]) {
+  const idx = (deg) => Math.round((deg / CELL_DEGREES) * 1e6) / 1e6
+  const keys = []
+  for (let i = Math.ceil(idx(south)); i + 1 <= Math.floor(idx(north)); i++) {
+    for (let j = Math.ceil(idx(west)); j + 1 <= Math.floor(idx(east)); j++) keys.push(`${i}_${j}`)
+  }
+  return keys
+}
+
 async function upload(metros, app) {
   if (!app) throw new Error('upload needs --app <app name or URL>, e.g. --app http://localhost:5173 or --app hurry-up')
   const progressFile = join(DATA_DIR, 'progress.json')
@@ -209,23 +243,13 @@ async function upload(metros, app) {
       for (const [i, batch] of batches(fresh).entries()) {
         const id = `${m}/${f}#${i}`
         if (progress[key(id)]) continue
-        // The CLI reads input files only from inside the project.
-        const inputFile = join(DATA_DIR, '.batch.json')
-        await writeFile(inputFile, JSON.stringify({ elements: batch }))
-        const { stdout } = await run('npx', ['deepspace', 'agent', 'invoke', app, 'restrooms_import', '--input-file', inputFile, '--json'], {
-          maxBuffer: 1 << 20,
-        }).catch((err) => ({ stdout: err.stdout ?? '' }))
-        const line = stdout.trim().split('\n').filter((l) => l.startsWith('{')).pop() ?? ''
-        let result
+        let r
         try {
-          result = JSON.parse(line)
-        } catch {
-          throw new Error(`Unreadable CLI output for ${id}: ${stdout.slice(0, 300)}`)
+          r = await invokeTool(app, 'restrooms_import', { elements: batch })
+        } catch (err) {
+          throw new Error(`Batch ${id}: ${err.message}. Fix and re-run; finished batches are skipped.`)
         }
-        const r = result.result ?? result.output ?? result
-        if (result.ok === false || typeof r.created !== 'number') {
-          throw new Error(`Batch ${id} refused: ${JSON.stringify(result).slice(0, 300)}. Fix and re-run; finished batches are skipped.`)
-        }
+        if (typeof r.created !== 'number') throw new Error(`Batch ${id}: unexpected result ${JSON.stringify(r).slice(0, 200)}`)
         log(`  ${id}: created ${r.created}, skipped ${r.skipped}, rejected ${r.rejected}, failed ${r.failed}`)
         // Only a fully saved batch is marked done; a partial one is retried on re-run.
         if (r.failed > 0) throw new Error(`Batch ${id} had ${r.failed} failed writes; re-run to retry it.`)
@@ -236,6 +260,25 @@ async function upload(metros, app) {
     }
     log(`${METROS[m].name}: ${JSON.stringify(metro)}`)
     for (const k of Object.keys(totals)) totals[k] += metro[k]
+
+    // Every batch of this metro is saved (a failure would have thrown above).
+    // Mark its cells covered only if every tile was fetched.
+    const missing = tilesFor(METROS[m].bbox).filter((t) => !files.includes(`${t.key}.json`))
+    if (missing.length) {
+      log(`${METROS[m].name}: ${missing.length} tile(s) not fetched; cells NOT marked covered (run fetch, then upload again)`)
+      continue
+    }
+    if (progress[key(`covered:${m}`)]) continue
+    const cells = cellsInside(METROS[m].bbox)
+    let marked = 0
+    for (let i = 0; i < cells.length; i += COVER_BATCH) {
+      const r = await invokeTool(app, 'restrooms_mark_covered', { cellKeys: cells.slice(i, i + COVER_BATCH) })
+      if (r.failed || r.invalid) throw new Error(`Marking ${METROS[m].name} covered: ${JSON.stringify(r)}; re-run to retry.`)
+      marked += r.marked
+    }
+    progress[key(`covered:${m}`)] = { cells: marked, at: new Date().toISOString() }
+    await writeFile(progressFile, JSON.stringify(progress, null, 2))
+    log(`${METROS[m].name}: ${marked} cells marked covered`)
   }
   log(`done (this run): ${JSON.stringify(totals)}`)
 }
