@@ -1,7 +1,8 @@
 /**
  * Home — full-screen map of nearby restrooms.
  *
- * Restrooms come from the `restrooms` collection via useQuery; the server only
+ * Restrooms come from the `restrooms` collection, loaded per grid cell in view
+ * (RestroomCells: one `useQuery` per cell, `where: { cellKey }`); the server only
  * ships rows the caller may read (active ones, for everyone but admins). The
  * map asks /api/restrooms/seed to fill in OpenStreetMap data for the grid
  * cells in view whenever it settles at a useful zoom.
@@ -22,10 +23,11 @@ import type {
   Marker as MapLibreMarker,
 } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import { getAuthToken, useAuthProfileReady, useQuery } from 'deepspace'
+import { getAuthToken, useAuthProfileReady } from 'deepspace'
 import { Accessibility, Car, Footprints, Info, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LocationControl } from '../../components/LocationControl'
+import { RestroomCells, type CellRecords } from '../../components/RestroomCells'
 import {
   directionsUrl,
   distanceMeters,
@@ -70,6 +72,12 @@ const SEED_BACKOFF_MAX_MS = 10 * 60_000
 const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c' }
 const UNAVAILABLE_COLOR = '#9ca3af'
 const AUTO_SELECT_WAIT_MS = 5000
+/** Below this zoom no cells load and restroom markers hide. */
+const MIN_VIEW_ZOOM = 12
+/** Cells subscribed for one view, nearest the centre first. */
+const MAX_VIEW_CELLS = 36
+/** Recently used cells stay subscribed so panning back is instant. */
+const RETAINED_CELLS = 64
 /** Auto-select only picks a restroom this close; farther is not "nearby". */
 const AUTO_SELECT_MAX_METERS = 5000
 /** Seeding waits this long for the first location answer before using the default city. */
@@ -95,6 +103,8 @@ const markerColor = [
   ['match', ['get', 'kind'], 'restaurant', KIND_COLOR.restaurant, KIND_COLOR.public],
 ] as ExpressionSpecification
 
+type RestroomRecord = CellRecords['records'][number]
+
 const GENDER_LABEL: Record<GenderType, string> = {
   men: 'Men',
   women: 'Women',
@@ -106,7 +116,22 @@ const KIND_LABEL: Record<RestroomKind, string> = { public: 'Public', restaurant:
 export default function HomePage() {
   const { user } = useAuthProfileReady({ requireUser: true })
   const isAdmin = user?.role === 'admin'
-  const { records, status: recordsStatus } = useQuery<Restroom>('restrooms')
+  // Restrooms arrive per subscribed grid cell (RestroomCells reports each).
+  const [subscribedCells, setSubscribedCells] = useState<string[]>([])
+  const [cellData, setCellData] = useState<Map<string, CellRecords>>(() => new Map())
+  const [zoomedOut, setZoomedOut] = useState(false)
+  const onCellReport = useCallback((key: string, value: CellRecords | null) => {
+    setCellData((prev) => {
+      if (!value && !prev.has(key)) return prev
+      const next = new Map(prev)
+      if (value) next.set(key, value)
+      else next.delete(key)
+      return next
+    })
+  }, [])
+  const records = useMemo(() => [...cellData.values()].flatMap((c) => c.records), [cellData])
+  const recordsStatus =
+    subscribedCells.length > 0 && subscribedCells.every((k) => cellData.get(k)?.ready) ? 'ready' : 'loading'
 
   const [genders, setGenders] = useState<Set<GenderType>>(() => new Set(GENDER_TYPES))
   const [kinds, setKinds] = useState<Set<RestroomKind>>(() => new Set(RESTROOM_KINDS))
@@ -163,8 +188,48 @@ export default function HomePage() {
       records.filter((r) => kinds.has(r.data.kind) && genders.has(r.data.genderType ?? 'unknown')),
     [records, kinds, genders],
   )
-  const selected = records.find((r) => r.recordId === selectedId) ?? null
-  const routeTarget = records.find((r) => r.recordId === routeTargetId) ?? null
+  // The selected restroom and the route target keep their last-seen record,
+  // so the panel and route survive their cell unloading (pan away, zoom out).
+  const byId = useMemo(() => new Map(records.map((r) => [r.recordId, r])), [records])
+  const pinned = useRef(new Map<string, RestroomRecord>())
+  const lookup = (id: string | null) => (id ? (byId.get(id) ?? pinned.current.get(id) ?? null) : null)
+  const selected = lookup(selectedId)
+  const routeTarget = lookup(routeTargetId)
+  useEffect(() => {
+    const keep = new Map<string, RestroomRecord>()
+    for (const id of [selectedId, routeTargetId]) {
+      const r = id ? (byId.get(id) ?? pinned.current.get(id)) : undefined
+      if (id && r) keep.set(id, r)
+    }
+    pinned.current = keep
+  }, [byId, selectedId, routeTargetId])
+
+  // Which cells to subscribe: the ones in view (capped), plus recently used.
+  const retainedCells = useRef<string[]>([])
+  const updateCells = useCallback(() => {
+    const map = mapRef.current
+    if (!map) return
+    if (map.getZoom() < MIN_VIEW_ZOOM) {
+      setZoomedOut(true)
+      return
+    }
+    setZoomedOut(false)
+    const b = map.getBounds()
+    const c = map.getCenter()
+    const inView = cellsInView(
+      { south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast() },
+      { latitude: c.lat, longitude: c.lng },
+      MAX_VIEW_CELLS,
+    ).map((cell) => cell.key)
+    const next = [...inView, ...retainedCells.current.filter((k) => !inView.includes(k))].slice(
+      0,
+      RETAINED_CELLS,
+    )
+    retainedCells.current = next
+    setSubscribedCells((prev) =>
+      prev.length === next.length && prev.every((k, i) => k === next[i]) ? prev : next,
+    )
+  }, [])
   const routeTargetIdRef = useRef<string | null>(null)
   useEffect(() => {
     routeTargetIdRef.current = routeTargetId
@@ -447,6 +512,7 @@ export default function HomePage() {
           })
         }
         setMapReady(true)
+        updateCells()
         gateTimer = setTimeout(() => {
           seedGateOpen.current = true
           void seedView()
@@ -459,6 +525,7 @@ export default function HomePage() {
       })
 
       map.on('moveend', () => {
+        updateCells()
         clearTimeout(debounce)
         debounce = setTimeout(() => {
           void seedView()
@@ -476,7 +543,7 @@ export default function HomePage() {
       mapRef.current = null
     }
     // loc.setManual is a stable callback; the map is created once.
-  }, [seedView, select, markInteraction, setManualLocation])
+  }, [seedView, select, markInteraction, setManualLocation, updateCells])
 
   // Open seeding once the first location answer is in.
   useEffect(() => {
@@ -535,18 +602,28 @@ export default function HomePage() {
     if (canvas) canvas.style.cursor = picking ? 'crosshair' : ''
   }, [picking, mapReady])
 
-  // Push filtered records into the map source.
+  // What the map draws: the filtered restrooms (none when zoomed out), plus
+  // the selected restroom and route destination wherever they are.
+  const mapRecords = useMemo(() => {
+    const drawn = zoomedOut ? [] : [...visible]
+    for (const r of [selected, routeTarget]) {
+      if (r && !drawn.some((d) => d.recordId === r.recordId)) drawn.push(r)
+    }
+    return drawn
+  }, [zoomedOut, visible, selected, routeTarget])
+
+  // Push them into the map source.
   useEffect(() => {
     const source = mapReady ? mapRef.current?.getSource<GeoJSONSource>('restrooms') : undefined
     source?.setData({
       type: 'FeatureCollection',
-      features: visible.map((r) => ({
+      features: mapRecords.map((r) => ({
         type: 'Feature',
         geometry: { type: 'Point', coordinates: [r.data.longitude, r.data.latitude] },
         properties: { id: r.recordId, kind: r.data.kind, status: r.data.status },
       })),
     })
-  }, [visible, mapReady])
+  }, [mapRecords, mapReady])
 
   // Show the selection: base layer without it, halo and large dot with it.
   useEffect(() => {
@@ -758,6 +835,7 @@ export default function HomePage() {
       <div className="absolute inset-0">
         <div ref={containerRef} className="h-full w-full" data-testid="restroom-map" />
       </div>
+      <RestroomCells cellKeys={subscribedCells} onReport={onCellReport} />
 
       {/* Above the details panel: an open location panel must stay usable. */}
       <div className="pointer-events-none absolute inset-x-3 top-3 z-20 flex flex-col gap-2 sm:right-auto sm:w-80">
@@ -782,7 +860,7 @@ export default function HomePage() {
             ))}
           </FilterRow>
           <p className="mt-2 text-xs text-muted-foreground" aria-live="polite">
-            {visible.length} shown
+            {zoomedOut ? 'Zoom in to see restrooms' : `${visible.length} shown`}
             {seedState === 'loading' && ' · loading nearby restrooms…'}
             {tooFarOut && ' · zoom in to load more'}
           </p>
