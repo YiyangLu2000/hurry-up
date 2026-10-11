@@ -13,3 +13,6 @@ src/router.ts
 src/modals.tsx
 .claude/launch.json
 .claude/worktrees
+
+# Raw OpenStreetMap downloads for scripts/import-osm.mjs
+data/osm/

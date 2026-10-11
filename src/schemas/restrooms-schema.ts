@@ -7,8 +7,11 @@
  * visibility value. Rows are created by a system identity, so no real user is
  * ever the owner and every non-admin caller sees exactly the active rows.
  *
+ * Clients load restrooms per seeding-grid cell (`where: { cellKey }`), never
+ * the whole collection. Every server write goes through `normalizeRestroom`.
+ *
  * `restroom_areas` records which seeding-grid cells were fetched from
- * Overpass and when. It is invisible to every client.
+ * Overpass and when, or covered by the bulk import. Invisible to every client.
  */
 
 import type { CollectionSchema } from 'deepspace/schema'
@@ -29,6 +32,20 @@ export interface Restroom {
   source: 'osm' | 'user'
   osmId?: string
   status: RestroomStatus
+  /** Seeding-grid cell (`cellForPoint` in src/lib/us-geo.ts); server-computed. */
+  cellKey: string
+}
+
+/**
+ * The one shape every server write uses. An empty or blank `osmId` (or
+ * `brand`) is dropped so it is stored as NULL: the SDK stores "" as "", and
+ * two "" osmIds in one cell would collide on the (cellKey, osmId) index.
+ */
+export function normalizeRestroom(row: Restroom): Restroom {
+  const out: Restroom = { ...row }
+  if (!out.osmId?.trim()) delete out.osmId
+  if (!out.brand?.trim()) delete out.brand
+  return out
 }
 
 export const GENDER_TYPES: GenderType[] = ['men', 'women', 'gender-neutral', 'unknown']
@@ -48,6 +65,7 @@ export const restroomsSchema: CollectionSchema = {
     { name: 'wheelchair', storage: 'text', interpretation: { kind: 'select', options: ['yes', 'no', 'unknown'] } },
     { name: 'source', storage: 'text', interpretation: { kind: 'select', options: ['osm', 'user'] }, required: true },
     { name: 'osmId', storage: 'text', interpretation: 'plain' },
+    { name: 'cellKey', storage: 'text', interpretation: 'plain' },
     {
       name: 'status',
       storage: 'text',
@@ -55,8 +73,15 @@ export const restroomsSchema: CollectionSchema = {
       required: true,
     },
   ],
-  // Dedup is by record id (`osm-<type>-<id>`), not `uniqueOn`: future
-  // user-submitted rows carry no osmId.
+  // This uniqueOn exists for the SQLite index it creates on (cellKey, osmId),
+  // which turns the client's per-cell `where: { cellKey }` query into an index
+  // lookup instead of a full-table scan. That index is undocumented SDK
+  // behaviour (RecordRoom issues CREATE UNIQUE INDEX for uniqueOn); if it ever
+  // stops, queries still work, only as scans. The uniqueness itself is not the
+  // goal: dedup is by record id (`osm-<type>-<id>`). Rows without an osmId
+  // (future user submissions) store NULL, and NULL never conflicts — see
+  // normalizeRestroom and restrooms-schema.test.ts.
+  uniqueOn: ['cellKey', 'osmId'],
   visibilityField: { field: 'status', value: 'active' },
   permissions: {
     '*': { read: 'published', ...NO_WRITES },
@@ -72,6 +97,9 @@ export const restroomAreasSchema: CollectionSchema = {
     { name: 'cellKey', storage: 'text', interpretation: 'plain', required: true },
     { name: 'fetchedAt', storage: 'number', interpretation: 'plain', required: true },
     { name: 'resultCount', storage: 'number', interpretation: 'plain' },
+    // 'import' once the bulk import saved this cell's restrooms: live seeding
+    // then never asks Overpass for it again (no 7-day expiry).
+    { name: 'coveredBy', storage: 'text', interpretation: { kind: 'select', options: ['import'] } },
   ],
   uniqueOn: ['cellKey'],
   permissions: {
