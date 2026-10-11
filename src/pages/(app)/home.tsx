@@ -88,6 +88,9 @@ const HALO_REST = { radius: 24, opacity: 0.5 }
 const CLICK_TOLERANCE_PX = 8
 const MARKER_LAYERS = ['restroom-selected', 'restroom-destination', 'restrooms']
 const ROUTE_COLOR = '#2563eb'
+/** Required by the ODbL for OpenStreetMap data (tiles, restrooms, search, routes). */
+const OSM_ATTRIBUTION =
+  '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>'
 /** Beyond this straight-line distance no route is requested (heavy for the service). */
 const MAX_ROUTE_METERS = 50_000
 /**
@@ -398,7 +401,7 @@ export default function HomePage() {
         center: [center.longitude, center.latitude],
         zoom: START_ZOOM,
         maxBounds: US_MAX_BOUNDS,
-        attributionControl: { compact: true, customAttribution: ROUTING_ATTRIBUTION },
+        attributionControl: { compact: true, customAttribution: [OSM_ATTRIBUTION, ROUTING_ATTRIBUTION] },
       })
       mapRef.current = map
       map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-right')
