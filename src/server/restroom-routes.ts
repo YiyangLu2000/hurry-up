@@ -18,11 +18,11 @@
 
 import type { Hono } from 'hono'
 import { resolveAppRole } from 'deepspace/worker'
-import type { ActionTools } from 'deepspace/worker'
-import { cellForPoint, cellFromKey, cellTouchesUS, type Cell } from '../lib/us-geo.js'
-import { normalizeRestroom } from '../schemas/restrooms-schema.js'
-import type { GenderType, Restroom, RestroomStatus, Wheelchair } from '../schemas/restrooms-schema.js'
+import { cellFromKey, cellTouchesUS, type Cell } from '../lib/us-geo.js'
+import { toRestroom, type OverpassElement } from '../lib/osm-restrooms.js'
+import type { RestroomStatus } from '../schemas/restrooms-schema.js'
 import { createActionTools } from './action-routes.js'
+import { saveNewRestrooms } from './restroom-writes.js'
 import { resolveAuth } from './http-routes.js'
 import type { AppContext, Env } from '../../worker.js'
 
@@ -32,16 +32,6 @@ const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
 ]
-const SAVE_CONCURRENCY = 8
-
-type OverpassElement = {
-  type: 'node' | 'way' | 'relation'
-  id: number
-  lat?: number
-  lon?: number
-  center?: { lat: number; lon: number }
-  tags?: Record<string, string>
-}
 
 type SeedResult =
   | { status: 'fresh'; fetchedAt: number }
@@ -104,79 +94,6 @@ async function fetchOverpass(cell: Cell): Promise<OverpassElement[]> {
   throw new OverpassUnavailableError(errors.join('; '))
 }
 
-function deriveGenderType(tags: Record<string, string>): GenderType {
-  if (tags.unisex === 'yes') return 'gender-neutral'
-  const male = tags.male === 'yes'
-  const female = tags.female === 'yes'
-  if (male && !female) return 'men'
-  if (female && !male) return 'women'
-  return 'unknown'
-}
-
-function deriveWheelchair(tags: Record<string, string>): Wheelchair {
-  const value = tags['toilets:wheelchair'] ?? tags.wheelchair
-  if (value === 'yes' || value === 'designated') return 'yes'
-  if (value === 'no') return 'no'
-  return 'unknown'
-}
-
-/** Maps an Overpass element to a new restroom row; null to skip it. */
-function toRestroom(el: OverpassElement): { recordId: string; data: Restroom } | null {
-  const tags = el.tags ?? {}
-  const latitude = el.lat ?? el.center?.lat
-  const longitude = el.lon ?? el.center?.lon
-  if (latitude === undefined || longitude === undefined) return null
-
-  const isToilet = tags.amenity === 'toilets'
-  if (!isToilet && !tags.brand) return null
-  // Toilets explicitly closed to the public are not "public restrooms".
-  if (isToilet && (tags.access === 'private' || tags.access === 'no')) return null
-
-  const brand = isToilet ? undefined : tags.brand
-  return {
-    recordId: `osm-${el.type}-${el.id}`,
-    data: normalizeRestroom({
-      name: tags.name ?? brand ?? 'Public restroom',
-      latitude,
-      longitude,
-      kind: isToilet ? 'public' : 'restaurant',
-      ...(brand ? { brand } : {}),
-      genderType: deriveGenderType(tags),
-      wheelchair: deriveWheelchair(tags),
-      source: 'osm',
-      osmId: `${el.type}/${el.id}`,
-      status: 'active',
-      cellKey: cellForPoint(latitude, longitude).key,
-    }),
-  }
-}
-
-/** Creates rows that do not exist yet. Returns created and failed counts. */
-async function saveNew(
-  tools: ActionTools,
-  rows: { recordId: string; data: Restroom }[],
-): Promise<{ created: number; failed: number }> {
-  let created = 0
-  let failed = 0
-  for (let i = 0; i < rows.length; i += SAVE_CONCURRENCY) {
-    await Promise.all(
-      rows.slice(i, i + SAVE_CONCURRENCY).map(async ({ recordId, data }) => {
-        // Existence check first: `create` with a known id merges into an
-        // existing row, which would overwrite a status set after seeding.
-        const existing = await tools.get('restrooms', recordId)
-        if (existing.success) return
-        const result = await tools.create('restrooms', { ...data }, recordId)
-        if (result.success) created++
-        else {
-          failed++
-          console.warn(`[restrooms] create ${recordId} failed: ${result.error}`)
-        }
-      }),
-    )
-  }
-  return { created, failed }
-}
-
 async function seedCell(env: Env, cell: Cell): Promise<SeedResult> {
   const tools = createActionTools(env, SEEDER_USER_ID, '')
   const now = Math.floor(Date.now() / 1000)
@@ -190,7 +107,7 @@ async function seedCell(env: Env, cell: Cell): Promise<SeedResult> {
 
   const elements = await fetchOverpass(cell)
   const rows = elements.map(toRestroom).filter((row) => row !== null)
-  const { created, failed } = await saveNew(tools, rows)
+  const { created, failed } = await saveNewRestrooms(tools, rows)
   if (failed > 0) {
     // Leave the cell unmarked so the next visit retries; saves are idempotent.
     throw new Error(`${failed} of ${rows.length} restrooms failed to save`)
