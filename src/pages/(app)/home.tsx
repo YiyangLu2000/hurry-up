@@ -58,6 +58,13 @@ import {
 } from '../../lib/us-geo'
 import type { ManualLocation, Point } from '../../lib/location'
 import { isInUSOutline } from '../../lib/us-outline'
+import {
+  canRouteFrom,
+  onOriginChange,
+  originKeyOf,
+  routeForOrigin,
+  type RouteTarget,
+} from '../../lib/route-origin'
 import { useUserLocation } from '../../lib/use-user-location'
 import {
   GENDER_TYPES,
@@ -74,13 +81,13 @@ const SEED_BACKOFF_BASE_MS = 30_000
 const SEED_BACKOFF_MAX_MS = 10 * 60_000
 const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c' }
 const UNAVAILABLE_COLOR = '#9ca3af'
-const AUTO_SELECT_WAIT_MS = 5000
 /** Below this zoom no cells load and restroom markers hide. */
 const MIN_VIEW_ZOOM = 12
 /** Cells subscribed for one view, nearest the centre first. */
 const MAX_VIEW_CELLS = 36
 /** Recently used cells stay subscribed so panning back is instant. */
 const RETAINED_CELLS = 64
+const AUTO_SELECT_WAIT_MS = 5000
 /** Auto-select only picks a restroom this close; farther is not "nearby". */
 const AUTO_SELECT_MAX_METERS = 5000
 /** Auto-select compares walking time for this many straight-line-nearest restrooms. */
@@ -100,12 +107,6 @@ const OSM_ATTRIBUTION =
   '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>'
 /** Beyond this straight-line distance no route is requested (heavy for the service). */
 const MAX_ROUTE_METERS = 50_000
-/**
- * Moving your location further than this starts fresh: the old selection and
- * route (chosen for the old spot) are dropped so the map centres on the new
- * one. Smaller corrections keep them.
- */
-const RELOCATE_RESET_METERS = 300
 const markerColor = [
   'case',
   ['!=', ['get', 'status'], 'active'],
@@ -151,6 +152,8 @@ export default function HomePage() {
   const [tooFarOut, setTooFarOut] = useState(false)
   const loc = useUserLocation()
   const userLocation = loc.location
+  /** The current origin: every route is tied to the origin it was requested from. */
+  const locationKey = originKeyOf(userLocation)
   const [picking, setPicking] = useState(false)
   const [pickError, setPickError] = useState<string | null>(null)
   const [seedState, setSeedState] = useState<'idle' | 'loading' | 'error'>('idle')
@@ -192,10 +195,17 @@ export default function HomePage() {
 
   // Routing. The route target is the last selected restroom; it outlives the
   // panel. `route` is what is drawn: a real route, or a straight fallback.
-  const [routeTargetId, setRouteTargetId] = useState<string | null>(null)
+  // The route destination, with the origin it was chosen from (rule 3).
+  const [routeTargetState, setRouteTargetState] = useState<RouteTarget | null>(null)
+  const routeTargetId = routeTargetState?.id ?? null
+  /** Set the route destination, remembering the current origin with it. */
+  const setRouteTargetId = (id: string | null) =>
+    setRouteTargetState(id ? { id, originKey: locationKey } : null)
   const [travelMode, setTravelMode] = useState<TravelMode>('walk')
   const [route, setRoute] = useState<{
     key: string
+    /** The origin this route was requested from (see src/lib/route-origin.ts). */
+    originKey: string
     targetId: string
     mode: TravelMode
     result: Route | { kind: 'fallback'; coordinates: LineCoords }
@@ -224,6 +234,8 @@ export default function HomePage() {
   }
   const selected = lookup(selectedId)
   const routeTarget = lookup(routeTargetId)
+  // Only a route requested from the current origin is ever drawn or shown.
+  const drawnRoute = routeForOrigin(route, locationKey)
   useEffect(() => {
     const keep = new Map<string, RestroomRecord>()
     for (const id of [selectedId, routeTargetId]) {
@@ -275,22 +287,13 @@ export default function HomePage() {
 
   /**
    * Set the visitor's location by hand (map tap or typed). The map moves to
-   * it at a zoom where restrooms load, so the ones around it appear. A real
-   * move (or one with no route showing) starts over: the old selection and
-   * route go, and the closest restroom to the new spot is selected and
-   * routed to once the restrooms around it have loaded.
+   * it at a zoom where restrooms load, so the ones around it appear. The new
+   * origin discards the old route and selection and starts a new closest-
+   * restroom pick (the origin-change effect below).
    */
   const setManual = loc.setManual
   const setManualLocation = useCallback(
     (p: ManualLocation) => {
-      const previous = locationRef.current
-      const moved = !previous || distanceMeters(p, previous) > RELOCATE_RESET_METERS
-      if (moved || !routeTargetIdRef.current) {
-        setRouteTargetId(null)
-        setSelectedId(null)
-        autoSelectAbort.current?.abort()
-        autoSelectDone.current = false
-      }
       setManual(p)
       // Arriving there fires moveend, which seeds the cells around it.
       mapRef.current?.easeTo({
@@ -673,7 +676,7 @@ export default function HomePage() {
     if (!map) return
     const id = selectedId ?? ''
     // The destination ring shows only while its restroom is not selected.
-    const dest = routeTargetId && routeTargetId !== selectedId && route ? routeTargetId : ''
+    const dest = routeTargetId && routeTargetId !== selectedId && drawnRoute ? routeTargetId : ''
     map.setFilter('restrooms', ['all', ['!=', ['get', 'id'], id], ['!=', ['get', 'id'], dest]])
     map.setFilter('restroom-destination', ['==', ['get', 'id'], dest])
     map.setFilter('restroom-halo', ['==', ['get', 'id'], id])
@@ -691,7 +694,7 @@ export default function HomePage() {
       frame = requestAnimationFrame(pulse)
     })
     return () => cancelAnimationFrame(frame)
-  }, [selectedId, routeTargetId, route, mapReady])
+  }, [selectedId, routeTargetId, drawnRoute, mapReady])
 
   // A selection becomes the route target; closing the panel keeps the target.
   useEffect(() => {
@@ -706,12 +709,17 @@ export default function HomePage() {
   const toLng = routeTarget?.data.longitude
   const fitPending = useRef(false)
   useEffect(() => {
-    if (!routeTargetId || fromLat === undefined || fromLng === undefined) {
+    // Only to a destination chosen from this same origin: in the render where
+    // the origin changes, the old destination is still set until the
+    // origin-change effect drops it, and must not get a route (or a straight
+    // fallback line) from the new origin.
+    if (!canRouteFrom(routeTargetState, locationKey) || fromLat === undefined || fromLng === undefined) {
       setRoute(null)
       setRoutePending(false)
       return
     }
     if (toLat === undefined || toLng === undefined) return
+    const target = routeTargetState
     const from = { latitude: fromLat, longitude: fromLng }
     const to = { latitude: toLat, longitude: toLng }
     const key = routeKey(travelMode, from, to)
@@ -726,7 +734,8 @@ export default function HomePage() {
         fitPending.current = true
         setRoute({
           key,
-          targetId: routeTargetId,
+          originKey: originKeyOf(from)!,
+          targetId: target.id,
           mode: travelMode,
           result: result ?? {
             kind: 'fallback',
@@ -742,7 +751,7 @@ export default function HomePage() {
         // Aborted: a newer request owns the state.
       })
     return () => controller.abort()
-  }, [routeTargetId, travelMode, fromLat, fromLng, toLat, toLng])
+  }, [routeTargetId, routeTargetState, locationKey, travelMode, fromLat, fromLng, toLat, toLng])
 
   // Draw the route, and fit it into view when a new one arrives. Closing the
   // panel does not produce a new route, so it never moves the map.
@@ -754,11 +763,11 @@ export default function HomePage() {
       geometry: { type: 'LineString' as const, coordinates },
       properties: { kind },
     })
-    const features = route ? [line(route.result.coordinates, route.result.kind)] : []
+    const features = drawnRoute ? [line(drawnRoute.result.coordinates, drawnRoute.result.kind)] : []
     // A real route starts and ends on the nearest road; dashed connectors
     // join it to the visitor and the restroom when the gap is noticeable.
-    if (route?.result.kind === 'route' && userLocation && routeTarget) {
-      const coords = route.result.coordinates
+    if (drawnRoute?.result.kind === 'route' && userLocation && routeTarget) {
+      const coords = drawnRoute.result.coordinates
       const ends: [Point, [number, number]][] = [
         [userLocation, coords[0]],
         [routeTarget.data, coords[coords.length - 1]],
@@ -770,9 +779,9 @@ export default function HomePage() {
       }
     }
     map.getSource<GeoJSONSource>('route')?.setData({ type: 'FeatureCollection', features })
-    if (!route || !fitPending.current) return
+    if (!drawnRoute || !fitPending.current) return
     fitPending.current = false
-    const coords = route.result.coordinates
+    const coords = drawnRoute.result.coordinates
     const lngs = coords.map((c) => c[0])
     const lats = coords.map((c) => c[1])
     const wide = window.innerWidth >= 640
@@ -791,12 +800,11 @@ export default function HomePage() {
       },
     )
     // userLocation/routeTarget only shape the connectors; a new route is what fits.
-  }, [route, mapReady, userLocation, routeTarget])
+  }, [drawnRoute, mapReady, userLocation, routeTarget])
 
   // Auto-select the nearest matching restroom, once per page load, when a
   // location (GPS or set on the map) becomes known. It waits for a seeding
   // pass that started afterwards, or a few seconds, so nearby rows are in.
-  const locationKey = userLocation ? `${userLocation.latitude},${userLocation.longitude}` : null
   const selectedIdRef = useRef<string | null>(null)
   const locationKeyRef = useRef<string | null>(null)
   useEffect(() => {
@@ -804,6 +812,32 @@ export default function HomePage() {
     locationKeyRef.current = locationKey
   })
   useEffect(() => () => autoSelectAbort.current?.abort(), [])
+  // Rule: a route belongs to its origin. When the origin changes (recenter,
+  // typed or tapped location), the old route, destination and selection are
+  // discarded and the closest-restroom pick runs again from the new origin.
+  // Drawing is already gated by routeForOrigin, so nothing stale is drawn
+  // even in the render before this runs.
+  const originRef = useRef<string | null>(locationKey)
+  useEffect(() => {
+    const previous = originRef.current
+    originRef.current = locationKey
+    if (previous === locationKey || previous === null) return // first location: nothing chosen yet
+    const next = onOriginChange(
+      { originKey: previous, targetId: routeTargetIdRef.current, selectedId: selectedIdRef.current },
+      locationKey,
+    )
+    setRouteTargetId(next.targetId)
+    setSelectedId(next.selectedId)
+    setRoute(null)
+    setWalkLeg(null)
+    autoSelectAbort.current?.abort()
+    autoSelectDone.current = false
+    autoSelectInterrupted.current = false
+  }, [locationKey])
+
+  // Bumped by "Recenter on me" to run the pick again even when the origin
+  // itself does not change (already on the device location).
+  const [pickNonce, setPickNonce] = useState(0)
   useEffect(() => {
     if (!locationKey || autoSelectDone.current) return
     setAutoSelectWait({ key: locationKey, pass: seedPassesRef.current, expired: false })
@@ -812,7 +846,7 @@ export default function HomePage() {
       AUTO_SELECT_WAIT_MS,
     )
     return () => clearTimeout(timer)
-  }, [locationKey])
+  }, [locationKey, pickNonce])
 
   useEffect(() => {
     if (autoSelectDone.current || !userLocation || !mapReady || selectedId) return
@@ -880,6 +914,34 @@ export default function HomePage() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [select])
+
+  /**
+   * "Recenter on me": back to the device location (dropping any typed one),
+   * centred there, old route and destination gone, and the closest-restroom
+   * pick run again exactly as on first load — the one allowed exception to
+   * once-per-page-load, because the visitor asked. False when the device
+   * location is unavailable; then nothing changes.
+   */
+  const clearManual = loc.clearManual
+  const recenterOnMe = useCallback((): boolean => {
+    const gps = loc.gps
+    if (!gps) return false
+    setRouteTargetId(null)
+    setSelectedId(null)
+    setRoute(null)
+    setWalkLeg(null)
+    autoSelectAbort.current?.abort()
+    autoSelectDone.current = false
+    autoSelectInterrupted.current = false
+    clearManual()
+    setPickNonce((n) => n + 1)
+    mapRef.current?.easeTo({
+      center: [gps.longitude, gps.latitude],
+      zoom: Math.max(START_ZOOM, MIN_SEED_ZOOM),
+      duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 800,
+    })
+    return true
+  }, [loc.gps, clearManual])
 
   const toggle = <T,>(set: Set<T>, value: T, update: (next: Set<T>) => void) => {
     const next = new Set(set)
@@ -963,12 +1025,10 @@ export default function HomePage() {
             setPickError(null)
             setPicking(false)
           }}
-          onRecenter={() => {
-            if (loc.gps) mapRef.current?.easeTo({ center: [loc.gps.longitude, loc.gps.latitude] })
-          }}
+          onRecenter={recenterOnMe}
         />
 
-        {route && (
+        {drawnRoute && (
           <button
             type="button"
             data-testid="clear-route"
@@ -994,7 +1054,9 @@ export default function HomePage() {
           }}
           route={(() => {
             const own =
-              route && route.targetId === selected.recordId && route.mode === travelMode ? route.result : null
+              drawnRoute && drawnRoute.targetId === selected.recordId && drawnRoute.mode === travelMode
+                ? drawnRoute.result
+                : null
             if (own?.kind === 'route') return own
             // The auto-select comparison already measured this walk.
             const measured =
