@@ -24,7 +24,7 @@ import type {
 } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { useAuthProfileReady } from 'deepspace'
-import { Accessibility, Car, Footprints, Info, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
+import { Accessibility, Car, Footprints, Info, Loader2, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LocationControl } from '../../components/LocationControl'
 import { RestroomCells, type CellRecords } from '../../components/RestroomCells'
@@ -51,6 +51,7 @@ import {
   type WalkLeg,
 } from '../../lib/routing'
 import {
+  cellForPoint,
   cellsInView,
   DEFAULT_CENTER,
   MIN_SEED_ZOOM,
@@ -58,6 +59,7 @@ import {
 } from '../../lib/us-geo'
 import type { ManualLocation, Point } from '../../lib/location'
 import { isInUSOutline } from '../../lib/us-outline'
+import { OVERLAY_CAP_MS, overlayDone, type OverlayKind } from '../../lib/loading-overlay'
 import {
   canRouteFrom,
   onOriginChange,
@@ -87,7 +89,6 @@ const MIN_VIEW_ZOOM = 12
 const MAX_VIEW_CELLS = 36
 /** Recently used cells stay subscribed so panning back is instant. */
 const RETAINED_CELLS = 64
-const AUTO_SELECT_WAIT_MS = 5000
 /** Auto-select only picks a restroom this close; farther is not "nearby". */
 const AUTO_SELECT_MAX_METERS = 5000
 /** Auto-select compares walking time for this many straight-line-nearest restrooms. */
@@ -157,14 +158,6 @@ export default function HomePage() {
   const [picking, setPicking] = useState(false)
   const [pickError, setPickError] = useState<string | null>(null)
   const [seedState, setSeedState] = useState<'idle' | 'loading' | 'error'>('idle')
-  // Completed seeding passes; auto-select waits for one that started after the
-  // location became known (or a timeout), so nearby rows have arrived.
-  const [seedPasses, setSeedPasses] = useState(0)
-  const [autoSelectWait, setAutoSelectWait] = useState<{
-    key: string
-    pass: number
-    expired: boolean
-  } | null>(null)
   // Once per page load: set after the auto-selection, or when the user
   // selects, closes, pans, or filters while their location is known.
   const autoSelectDone = useRef(false)
@@ -174,13 +167,15 @@ export default function HomePage() {
   const autoSelectInterrupted = useRef(false)
   // Walking duration/distance of the auto-selected restroom, from the
   // comparison, shown in its panel without another request.
+  // The location the closest-restroom pick last completed for (overlay).
+  const [pickedFor, setPickedFor] = useState<string | null>(null)
+  // The location the pick found no restroom in range for (it keeps watching).
+  const [nothingFoundFor, setNothingFoundFor] = useState<string | null>(null)
   const [walkLeg, setWalkLeg] = useState<(NonNullable<WalkLeg> & { recordId: string; fromKey: string }) | null>(null)
   const locationRef = useRef<Point | null>(userLocation)
-  const seedPassesRef = useRef(0)
   const pickingRef = useRef(false)
   useEffect(() => {
     locationRef.current = userLocation
-    seedPassesRef.current = seedPasses
     pickingRef.current = picking
   })
   // Seeding stays closed until the first location answer (or a timeout), so a
@@ -337,10 +332,8 @@ export default function HomePage() {
       rerun.current = true
       return
     }
-    const passDone = () => setSeedPasses((n) => n + 1)
     if (map.getZoom() < MIN_SEED_ZOOM) {
       setTooFarOut(true)
-      passDone()
       return
     }
     setTooFarOut(false)
@@ -356,7 +349,6 @@ export default function HomePage() {
       return force || !wait || wait.retryAt <= now
     })
     if (cells.length === 0) {
-      passDone()
       return
     }
 
@@ -395,7 +387,6 @@ export default function HomePage() {
     }
     running.current = false
     setSeedState(failed ? 'error' : 'idle')
-    passDone()
     if (rerun.current && !failed) {
       rerun.current = false
       void seedView()
@@ -838,35 +829,33 @@ export default function HomePage() {
   // Bumped by "Recenter on me" to run the pick again even when the origin
   // itself does not change (already on the device location).
   const [pickNonce, setPickNonce] = useState(0)
-  useEffect(() => {
-    if (!locationKey || autoSelectDone.current) return
-    setAutoSelectWait({ key: locationKey, pass: seedPassesRef.current, expired: false })
-    const timer = setTimeout(
-      () => setAutoSelectWait((w) => (w && w.key === locationKey ? { ...w, expired: true } : w)),
-      AUTO_SELECT_WAIT_MS,
-    )
-    return () => clearTimeout(timer)
-  }, [locationKey, pickNonce])
+
+  // The cell under the current location has its restrooms. The pick (and the
+  // loading overlay) wait for this — never for live seeding: right after a
+  // move the old area's cells are still "ready", hence the location cell.
+  const locationCell = userLocation ? cellForPoint(userLocation.latitude, userLocation.longitude).key : null
+  const locationCellsReady =
+    !zoomedOut && recordsStatus === 'ready' && !!locationCell && subscribedCells.includes(locationCell)
 
   useEffect(() => {
     if (autoSelectDone.current || !userLocation || !mapReady || selectedId) return
-    if (recordsStatus !== 'ready' || visible.length === 0) return
-    const wait = autoSelectWait
-    if (!wait || wait.key !== locationKey) return
-    // A seeding pass that finished after the location was set (or the timeout):
-    // judging "closest" earlier could miss restrooms still loading nearby.
-    const seeded = seedState !== 'loading' && seedPasses > wait.pass
-    if (!seeded && !wait.expired) return
+    // Pick once the restrooms around the location have loaded from the
+    // database. Live seeding is not awaited: in imported areas it adds
+    // nothing, and elsewhere new rows re-run this effect as they arrive.
+    if (!locationCellsReady) return
     // Candidates: the nearest restrooms in a straight line, within range.
-    // None nearby loaded yet: keep waiting for seeding (or until the user
-    // interacts) rather than selecting something across the country.
+    // None nearby loaded yet: keep watching (rows from live seeding re-run
+    // this) rather than selecting something across the country.
     const candidates = visible
       .map((r) => ({ r, d: distanceMeters(userLocation, r.data) }))
       .filter((c) => c.d <= AUTO_SELECT_MAX_METERS)
       .sort((a, b) => a.d - b.d)
       .slice(0, AUTO_SELECT_CANDIDATES)
       .map((c) => c.r)
-    if (candidates.length === 0) return
+    if (candidates.length === 0) {
+      setNothingFoundFor(locationKey)
+      return
+    }
     // Claim this page load's one auto-select now; nothing is selected until
     // the walking-time comparison answers (or times out).
     autoSelectDone.current = true
@@ -886,6 +875,7 @@ export default function HomePage() {
         const leg = legs?.[index]
         setWalkLeg(leg ? { ...leg, recordId: chosen.recordId, fromKey } : null)
         setSelectedId(chosen.recordId)
+        setPickedFor(fromKey)
         const map = mapRef.current
         const at: [number, number] = [chosen.data.longitude, chosen.data.latitude]
         if (map && !map.getBounds().contains(at)) map.easeTo({ center: at })
@@ -895,17 +885,15 @@ export default function HomePage() {
     locationKey,
     mapReady,
     selectedId,
-    recordsStatus,
+    locationCellsReady,
     visible,
-    autoSelectWait,
-    seedState,
-    seedPasses,
+    pickNonce,
   ])
 
   // Escape closes the panel.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return
+      if (e.key !== 'Escape' || overlayRef.current) return
       if (pickingRef.current) {
         setPicking(false)
         setPickError(null)
@@ -914,6 +902,64 @@ export default function HomePage() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [select])
+
+  // ---------------------------------------------------------------------------
+  // Blocking loading overlay: first load (cap 5 s) and re-picks after
+  // "Recenter on me" or a typed location (cap 3 s). See src/lib/loading-overlay.ts.
+  // ---------------------------------------------------------------------------
+  const [overlay, setOverlay] = useState<{ kind: OverlayKind; startedAt: number } | null>(() => ({
+    kind: 'initial',
+    startedAt: Date.now(),
+  }))
+  const overlayRef = useRef(overlay)
+  useEffect(() => {
+    overlayRef.current = overlay
+  })
+  const startOverlay = useCallback((kind: OverlayKind) => {
+    setPickedFor(null)
+    setNothingFoundFor(null)
+    setOverlay({ kind, startedAt: Date.now() })
+  }, [])
+  const closeOverlay = useCallback(() => setOverlay(null), [])
+
+  const cellsReady = zoomedOut || (userLocation ? locationCellsReady : recordsStatus === 'ready')
+  const locationPending = !loc.settled || loc.gpsStatus === 'locating'
+  const nothingNearby = !!locationKey && nothingFoundFor === locationKey
+  const loadingDone = overlayDone({
+    mapReady,
+    cellsReady,
+    hasLocation: !!userLocation,
+    locationPending,
+    picked: !!locationKey && pickedFor === locationKey,
+    selected: !!selectedId,
+    routeDrawn: !!selectedId && drawnRoute?.targetId === selectedId,
+    nothingNearby,
+  })
+  // Close when everything is in…
+  useEffect(() => {
+    if (overlay && loadingDone) setOverlay(null)
+  }, [overlay, loadingDone])
+  // …or at the cap, whatever is still pending (it keeps loading behind).
+  useEffect(() => {
+    if (!overlay) return
+    const left = overlay.startedAt + OVERLAY_CAP_MS[overlay.kind] - Date.now()
+    const timer = setTimeout(() => setOverlay(null), Math.max(0, left))
+    return () => clearTimeout(timer)
+  }, [overlay])
+  // Focus: into the overlay while it is up; back to the map when it closes.
+  const overlayBoxRef = useRef<HTMLDivElement>(null)
+  const hadOverlay = useRef(false)
+  useEffect(() => {
+    if (overlay) {
+      overlayBoxRef.current?.focus()
+      hadOverlay.current = true
+    } else if (hadOverlay.current) {
+      hadOverlay.current = false
+      mapRef.current?.getCanvas().focus()
+    }
+  }, [overlay])
+  const askingForLocation =
+    !userLocation && locationPending && loc.permission !== 'granted' && loc.permission !== 'denied'
 
   /**
    * "Recenter on me": back to the device location (dropping any typed one),
@@ -935,13 +981,14 @@ export default function HomePage() {
     autoSelectInterrupted.current = false
     clearManual()
     setPickNonce((n) => n + 1)
+    startOverlay('repick')
     mapRef.current?.easeTo({
       center: [gps.longitude, gps.latitude],
       zoom: Math.max(START_ZOOM, MIN_SEED_ZOOM),
       duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 800,
     })
     return true
-  }, [loc.gps, clearManual])
+  }, [loc.gps, clearManual, startOverlay])
 
   const toggle = <T,>(set: Set<T>, value: T, update: (next: Set<T>) => void) => {
     const next = new Set(set)
@@ -956,6 +1003,8 @@ export default function HomePage() {
 
   return (
     <div className="relative h-full w-full">
+      {/* While the loading overlay is up, nothing behind it takes clicks, typing or focus. */}
+      <div className="absolute inset-0" inert={!!overlay}>
       {/* maplibre's unlayered `.maplibregl-map { position: relative }` beats
           Tailwind's layered utilities, so the map element itself must not rely
           on `absolute inset-0` for its size — the wrapper provides it. */}
@@ -1019,6 +1068,7 @@ export default function HomePage() {
           onChoosePlace={(place) => {
             setPickError(null)
             setPicking(false)
+            startOverlay('repick')
             setManualLocation(place)
           }}
           onCancelPick={() => {
@@ -1072,6 +1122,47 @@ export default function HomePage() {
           showAdminInfo={isAdmin}
           onClose={() => select(null)}
         />
+      )}
+      </div>
+
+      {overlay && (
+        <div
+          ref={overlayBoxRef}
+          tabIndex={-1}
+          role="dialog"
+          aria-modal="true"
+          aria-busy="true"
+          aria-labelledby="loading-overlay-message"
+          data-testid="loading-overlay"
+          data-kind={overlay.kind}
+          className="absolute inset-0 z-30 flex items-center justify-center bg-background/70 px-4 outline-none backdrop-blur-[2px]"
+        >
+          <div className="w-full max-w-xs rounded-lg border border-border bg-card p-5 text-center text-card-foreground shadow-card">
+            <Loader2 aria-hidden="true" className="mx-auto h-6 w-6 animate-spin text-primary" />
+            <p id="loading-overlay-message" role="status" aria-live="polite" className="mt-3 text-sm font-medium">
+              {askingForLocation
+                ? 'Waiting for your location…'
+                : overlay.kind === 'repick'
+                  ? 'Finding the closest restroom…'
+                  : 'Finding restrooms near you…'}
+            </p>
+            {askingForLocation && (
+              <>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Answer your browser&apos;s location prompt, or continue without it.
+                </p>
+                <button
+                  type="button"
+                  data-testid="continue-without-location"
+                  onClick={closeOverlay}
+                  className="mt-3 rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-muted"
+                >
+                  Continue without location
+                </button>
+              </>
+            )}
+          </div>
+        </div>
       )}
     </div>
   )
