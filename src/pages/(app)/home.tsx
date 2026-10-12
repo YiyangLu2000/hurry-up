@@ -70,6 +70,7 @@ import {
   type RouteTarget,
 } from '../../lib/route-origin'
 import { useUserLocation } from '../../lib/use-user-location'
+import { useRefreshNonce } from '../../lib/use-refresh-nonce'
 import {
   GENDER_TYPES,
   RESTROOM_KINDS,
@@ -136,6 +137,9 @@ export default function HomePage() {
   const [subscribedCells, setSubscribedCells] = useState<string[]>([])
   const [cellData, setCellData] = useState<Map<string, CellRecords>>(() => new Map())
   const [zoomedOut, setZoomedOut] = useState(false)
+  // Re-subscribes the loaded cells every 2 minutes and on tab refocus, so
+  // restrooms that became premium or unavailable leave open maps.
+  const refreshNonce = useRefreshNonce()
   const onCellReport = useCallback((key: string, value: CellRecords | null) => {
     setCellData((prev) => {
       if (!value && !prev.has(key)) return prev
@@ -1051,7 +1055,7 @@ export default function HomePage() {
       <div className="absolute inset-0">
         <div ref={containerRef} className="h-full w-full" data-testid="restroom-map" />
       </div>
-      <RestroomCells cellKeys={cellKeysToLoad} onReport={onCellReport} />
+      <RestroomCells cellKeys={cellKeysToLoad} refreshNonce={refreshNonce} onReport={onCellReport} />
 
       {/* Above the details panel: an open location panel must stay usable. */}
       <div className="pointer-events-none absolute inset-x-3 top-3 z-20 flex flex-col gap-2 sm:right-auto sm:w-80">
