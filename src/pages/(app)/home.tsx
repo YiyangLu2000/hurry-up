@@ -1160,6 +1160,9 @@ export default function HomePage() {
           id={selected.recordId}
           restroom={selected.data}
           userLocation={userLocation}
+          // A location the visitor set themselves is the start of the
+          // Apple/Google directions; with GPS the maps app uses the device.
+          directionsFrom={loc.source === 'manual' ? userLocation : null}
           travelMode={travelMode}
           onTravelModeChange={(mode) => {
             setTravelMode(mode)
@@ -1276,6 +1279,7 @@ function RestroomDetails({
   id,
   restroom,
   userLocation,
+  directionsFrom,
   travelMode,
   onTravelModeChange,
   route,
@@ -1286,6 +1290,8 @@ function RestroomDetails({
   id: string
   restroom: Restroom
   userLocation: { latitude: number; longitude: number } | null
+  /** Start of the Apple/Google directions; null = the device's own location. */
+  directionsFrom: { latitude: number; longitude: number } | null
   travelMode: TravelMode
   onTravelModeChange: (mode: TravelMode) => void
   route: RouteSummary | { kind: 'fallback' } | null
@@ -1351,6 +1357,7 @@ function RestroomDetails({
       <Directions
         restroom={restroom}
         userLocation={userLocation}
+        directionsFrom={directionsFrom}
         travelMode={travelMode}
         onTravelModeChange={onTravelModeChange}
         route={route}
@@ -1373,6 +1380,7 @@ const APPLE_DEVICE = typeof navigator !== 'undefined' && isAppleDevice(navigator
 function Directions({
   restroom,
   userLocation,
+  directionsFrom,
   travelMode,
   onTravelModeChange,
   route,
@@ -1380,6 +1388,7 @@ function Directions({
 }: {
   restroom: Restroom
   userLocation: { latitude: number; longitude: number } | null
+  directionsFrom: { latitude: number; longitude: number } | null
   travelMode: TravelMode
   onTravelModeChange: (mode: TravelMode) => void
   route: RouteSummary | { kind: 'fallback' } | null
@@ -1450,7 +1459,7 @@ function Directions({
       <div className="flex flex-wrap items-center gap-2">
         <a
           data-testid="directions-walk"
-          href={directionsUrl(provider, 'walk', restroom)}
+          href={directionsUrl(provider, 'walk', restroom, directionsFrom)}
           target="_blank"
           rel="noopener noreferrer"
           className={linkClass}
@@ -1460,7 +1469,7 @@ function Directions({
         </a>
         <a
           data-testid="directions-drive"
-          href={directionsUrl(provider, 'drive', restroom)}
+          href={directionsUrl(provider, 'drive', restroom, directionsFrom)}
           target="_blank"
           rel="noopener noreferrer"
           className={linkClass}

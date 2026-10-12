@@ -52,3 +52,24 @@ describe('distance', () => {
     expect(walkingMinutes(20)).toBe(1)
   })
 })
+
+describe('directionsUrl with a start point (a location the visitor set)', () => {
+  const from = { latitude: 47.6505, longitude: -122.3205 }
+
+  it('starts Apple Maps there (saddr)', () => {
+    expect(directionsUrl('apple', 'walk', to, from)).toBe(
+      'https://maps.apple.com/?saddr=47.650500,-122.320500&daddr=34.052200,-118.243700&dirflg=w',
+    )
+  })
+
+  it('starts Google Maps there (origin)', () => {
+    expect(directionsUrl('google', 'drive', to, from)).toBe(
+      'https://www.google.com/maps/dir/?api=1&origin=47.650500,-122.320500&destination=34.052200,-118.243700&travelmode=driving',
+    )
+  })
+
+  it('leaves the start to the device when there is none', () => {
+    expect(directionsUrl('apple', 'walk', to, null)).toBe(directionsUrl('apple', 'walk', to))
+    expect(directionsUrl('google', 'walk', to, null)).not.toContain('origin=')
+  })
+})

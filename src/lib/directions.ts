@@ -1,9 +1,11 @@
 /**
  * Directions links and straight-line distance for the restroom details panel.
  *
- * Links carry only a destination, so the maps app routes from the device's
- * current location. Only https links are used: an app scheme such as
- * comgooglemaps:// fails outright when the app is not installed.
+ * Without `from`, a link carries only the destination, so the maps app routes
+ * from the device's current location. With `from` (a location the visitor
+ * set themselves), the route starts there instead. Only https links are
+ * used: an app scheme such as comgooglemaps:// fails outright when the app
+ * is not installed.
  */
 
 export type MapsProvider = 'apple' | 'google'
@@ -13,12 +15,14 @@ type Point = { latitude: number; longitude: number }
 
 const coord = (p: Point) => `${p.latitude.toFixed(6)},${p.longitude.toFixed(6)}`
 
-export function directionsUrl(provider: MapsProvider, mode: TravelMode, to: Point): string {
+export function directionsUrl(provider: MapsProvider, mode: TravelMode, to: Point, from?: Point | null): string {
   if (provider === 'apple') {
-    return `https://maps.apple.com/?daddr=${coord(to)}&dirflg=${mode === 'walk' ? 'w' : 'd'}`
+    const start = from ? `saddr=${coord(from)}&` : ''
+    return `https://maps.apple.com/?${start}daddr=${coord(to)}&dirflg=${mode === 'walk' ? 'w' : 'd'}`
   }
   const travelmode = mode === 'walk' ? 'walking' : 'driving'
-  return `https://www.google.com/maps/dir/?api=1&destination=${coord(to)}&travelmode=${travelmode}`
+  const start = from ? `&origin=${coord(from)}` : ''
+  return `https://www.google.com/maps/dir/?api=1${start}&destination=${coord(to)}&travelmode=${travelmode}`
 }
 
 /** iPhone, iPad (iPadOS reports a Macintosh user agent), and Mac. */
