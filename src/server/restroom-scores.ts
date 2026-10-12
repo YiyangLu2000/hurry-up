@@ -160,41 +160,83 @@ export async function recomputeRestroom(tools: ActionTools, restroomId: string):
   return null
 }
 
-export type BackfillResult = { restrooms: number; alreadySet: number; recomputed: number; failed: number }
+export type BackfillResult = {
+  restrooms: number
+  alreadySet: number
+  recomputed: number
+  failed: number
+  /** False when the call budget ran out first: call again with the same cells. */
+  complete: boolean
+}
 
 /**
- * Give every restroom in one cell a summary row and a visibility. Re-running
- * it is safe: rows whose summary and visibility already agree are skipped
- * without a write, and every other row goes through recomputeRestroom — the
- * only code that writes a summary — so a rating saved while the backfill
- * runs is never overwritten by a bare sample score.
+ * Record calls one row can need in the worst case: a first read of its
+ * inputs (3), then per round two writes and a verifying read (5).
  */
-export async function backfillCell(tools: ActionTools, cellKey: string): Promise<BackfillResult> {
-  const [restrooms, scores] = await Promise.all([
-    queryRows<Restroom>(tools, 'restrooms', { cellKey }),
-    queryRows<RestroomScore>(tools, 'restroom_scores', { cellKey }),
-  ])
-  const byId = new Map(scores.map((s) => [s.recordId, s.data]))
-  const result: BackfillResult = { restrooms: restrooms.length, alreadySet: 0, recomputed: 0, failed: 0 }
+const WORST_CASE_CALLS_PER_ROW = 3 + MAX_ROUNDS * 5
 
-  for (const row of restrooms) {
-    const stored = byId.get(row.recordId)
-    const settled =
-      stored &&
-      stored.ratingCount === 0 &&
-      stored.sampleScore === sampleScore(row.recordId) &&
-      stored.score === stored.sampleScore &&
-      row.data.visibility === visibilityFor(row.data.status, stored.score)
-    if (settled) {
-      result.alreadySet++
-      continue
-    }
-    try {
-      await recomputeRestroom(tools, row.recordId)
-      result.recomputed++
-    } catch (err) {
-      result.failed++
-      console.warn(`[scores] backfill ${row.recordId} failed: ${err instanceof Error ? err.message : String(err)}`)
+/** Counts every record call made through `tools`. */
+function countCalls(tools: ActionTools): { tools: ActionTools; used: () => number } {
+  let used = 0
+  const counted = new Proxy(tools, {
+    get(target, key, receiver) {
+      const value = Reflect.get(target, key, receiver)
+      if (typeof value !== 'function') return value
+      return (...args: unknown[]) => {
+        used++
+        return (value as (...a: unknown[]) => unknown).apply(target, args)
+      }
+    },
+  })
+  return { tools: counted, used: () => used }
+}
+
+/**
+ * Give every restroom in these cells a summary row and a visibility, using
+ * at most `maxCalls` record calls. Each record call is a subrequest, and a
+ * Worker invocation may make only so many (Cloudflare refuses the rest with
+ * "Too many API requests by single Worker invocation"), so the work stops
+ * before a row that might not fit and answers `complete: false`; calling
+ * again with the same cells continues, because finished rows are skipped.
+ *
+ * Re-running is safe: rows whose summary and visibility already agree are
+ * skipped without a write, and every other row goes through
+ * recomputeRestroom — the only code that writes a summary — so a rating
+ * saved while the backfill runs is never overwritten by a bare sample score.
+ */
+export async function backfillCells(tools: ActionTools, cellKeys: string[], maxCalls: number): Promise<BackfillResult> {
+  const counter = countCalls(tools)
+  const result: BackfillResult = { restrooms: 0, alreadySet: 0, recomputed: 0, failed: 0, complete: true }
+
+  for (const cellKey of cellKeys) {
+    if (counter.used() + 2 > maxCalls) return { ...result, complete: false }
+    const [restrooms, scores] = await Promise.all([
+      queryRows<Restroom>(counter.tools, 'restrooms', { cellKey }),
+      queryRows<RestroomScore>(counter.tools, 'restroom_scores', { cellKey }),
+    ])
+    const byId = new Map(scores.map((s) => [s.recordId, s.data]))
+    result.restrooms += restrooms.length
+
+    for (const row of restrooms) {
+      const stored = byId.get(row.recordId)
+      const settled =
+        stored &&
+        stored.ratingCount === 0 &&
+        stored.sampleScore === sampleScore(row.recordId) &&
+        stored.score === stored.sampleScore &&
+        row.data.visibility === visibilityFor(row.data.status, stored.score)
+      if (settled) {
+        result.alreadySet++
+        continue
+      }
+      if (counter.used() + WORST_CASE_CALLS_PER_ROW > maxCalls) return { ...result, complete: false }
+      try {
+        await recomputeRestroom(counter.tools, row.recordId)
+        result.recomputed++
+      } catch (err) {
+        result.failed++
+        console.warn(`[scores] backfill ${row.recordId} failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
     }
   }
   return result

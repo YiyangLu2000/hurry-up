@@ -8,7 +8,10 @@
  *
  * 1. Pages through `restrooms_list_cells` to get every cell with restrooms.
  * 2. Sends the cells to `restrooms_backfill_scores`, 10 per call, a few calls
- *    at a time (different cells never touch the same rows).
+ *    at a time (different cells never touch the same rows). One call does a
+ *    bounded amount of work (a Worker invocation may make only so many
+ *    subrequests); a call answering complete: false is repeated with the
+ *    same cells until they are done.
  *
  * Safe to re-run at any time, including after an interruption: rows that are
  * already correct are skipped without a write, rated restrooms are
@@ -25,6 +28,8 @@ import { promisify } from 'node:util'
 const run = promisify(execFile)
 const CELLS_PER_CALL = 10 // MAX_BACKFILL_CELLS_PER_CALL in src/server/restroom-admin-tools.ts
 const RETRIES = 3
+/** A batch needs a few calls the first time (dense cells); this only catches a stuck one. */
+const MAX_CALLS_PER_BATCH = 50
 
 const args = process.argv.slice(2)
 const opt = (name, fallback) => {
@@ -81,8 +86,20 @@ let done = 0
 async function worker() {
   while (next < batches.length) {
     const batch = batches[next++]
-    const r = await invokeTool('restrooms_backfill_scores', { cellKeys: batch })
-    for (const k of Object.keys(total)) total[k] += r[k] ?? 0
+    // One call does a bounded amount of work (the Worker subrequest limit);
+    // repeat it until the server says these cells are complete. Rows already
+    // done are skipped, so only the last call's alreadySet counts.
+    let r
+    let calls = 0
+    do {
+      r = await invokeTool('restrooms_backfill_scores', { cellKeys: batch })
+      total.recomputed += r.recomputed ?? 0
+      total.failed += r.failed ?? 0
+      if (++calls > MAX_CALLS_PER_BATCH) throw new Error(`cells ${batch.join(',')} still incomplete after ${calls} calls`)
+    } while (!r.complete)
+    total.restrooms += r.restrooms ?? 0
+    total.alreadySet += r.alreadySet ?? 0
+    total.invalid += r.invalid ?? 0
     done++
     if (done % 20 === 0 || done === batches.length) {
       log(`  ${done}/${batches.length} calls, ${total.restrooms} restrooms, ${((Date.now() - started) / 1000).toFixed(0)} s`)

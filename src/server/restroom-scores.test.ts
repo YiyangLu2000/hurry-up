@@ -3,7 +3,7 @@ import { sampleScore } from '../lib/scores'
 import { ratingRecordId } from '../schemas/ratings-schema'
 import type { Restroom } from '../schemas/restrooms-schema'
 import { fakeRecordTools } from './fake-record-tools'
-import { backfillCell, recomputeRestroom } from './restroom-scores'
+import { backfillCells, recomputeRestroom } from './restroom-scores'
 
 const CELL = '2382_-6117'
 const PUBLIC_ID = 'osm-node-42' // sample 3.6
@@ -103,19 +103,21 @@ describe('recomputeRestroom', () => {
   })
 })
 
-describe('backfillCell', () => {
+describe('backfillCells', () => {
+  const backfillCell = (tools: Parameters<typeof backfillCells>[0], cell: string) => backfillCells(tools, [cell], 10_000)
+
   it('sets sample scores and visibility, and a re-run writes nothing', async () => {
     const { tools, table, calls } = setup([PUBLIC_ID, PREMIUM_ID, 'osm-node-7'])
     table('restrooms').set('osm-node-7', { ...restroom('unavailable') })
 
-    expect(await backfillCell(tools, CELL)).toEqual({ restrooms: 3, alreadySet: 0, recomputed: 3, failed: 0 })
+    expect(await backfillCell(tools, CELL)).toEqual({ restrooms: 3, alreadySet: 0, recomputed: 3, failed: 0, complete: true })
     expect(table('restrooms').get(PUBLIC_ID)?.visibility).toBe('public')
     expect(table('restrooms').get(PREMIUM_ID)?.visibility).toBe('premium')
     expect(table('restrooms').get('osm-node-7')?.visibility).toBe('hidden')
     expect(table('restroom_scores').get(PREMIUM_ID)).toMatchObject({ sampleScore: 4.1, score: 4.1, ratingCount: 0 })
 
     const writesBefore = calls.writes
-    expect(await backfillCell(tools, CELL)).toEqual({ restrooms: 3, alreadySet: 3, recomputed: 0, failed: 0 })
+    expect(await backfillCell(tools, CELL)).toEqual({ restrooms: 3, alreadySet: 3, recomputed: 0, failed: 0, complete: true })
     expect(calls.writes).toBe(writesBefore)
   })
 
@@ -126,5 +128,22 @@ describe('backfillCell', () => {
     await backfillCell(tools, CELL)
     expect(table('restroom_scores').get(PUBLIC_ID)).toMatchObject({ ratingCount: 1, score: 5 })
     expect(table('restrooms').get(PUBLIC_ID)?.visibility).toBe('premium')
+  })
+
+  it('stays within its call budget and finishes when called again', async () => {
+    const ids = Array.from({ length: 40 }, (_, i) => `osm-node-${500 + i}`)
+    const { tools, table, calls } = setup(ids)
+    const BUDGET = 100
+    let rounds = 0
+    let result
+    do {
+      const before = calls.reads + calls.writes
+      result = await backfillCells(tools, [CELL], BUDGET)
+      expect(calls.reads + calls.writes - before).toBeLessThanOrEqual(BUDGET)
+      rounds++
+    } while (!result.complete && rounds < 20)
+    expect(result.complete).toBe(true)
+    expect(rounds).toBeGreaterThan(1)
+    for (const id of ids) expect(table('restrooms').get(id)?.visibility).toBeDefined()
   })
 })
