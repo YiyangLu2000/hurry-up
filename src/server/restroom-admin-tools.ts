@@ -46,6 +46,8 @@ const MAX_CELLS_PER_CALL = 1000
  * one call well inside a request's time and subrequest budget.
  */
 const MAX_BACKFILL_CELLS_PER_CALL = 10
+/** Keeps a restrooms_list_cells answer under the agent route's result cap. */
+const MAX_CELLS_PER_PAGE = 1000
 
 const requestScope = new AsyncLocalStorage<{ env: Env; userId: string | null }>()
 
@@ -161,9 +163,12 @@ export function buildRestroomAdminTools(): ToolSet {
 
     restrooms_list_cells: tool({
       description:
-        'Admin only, read-only. Lists every grid cell that holds at least one restroom, with its restroom count. Use it to drive restrooms_backfill_scores.',
-      inputSchema: z.object({}),
-      execute: async () => {
+        'Admin only, read-only. Lists the grid cells that hold at least one restroom, sorted by cellKey, one page at a time (pass the returned nextOffset until it is null). Use it to drive restrooms_backfill_scores.',
+      inputSchema: z.object({
+        offset: z.number().int().min(0).default(0),
+        limit: z.number().int().min(1).max(MAX_CELLS_PER_PAGE).default(MAX_CELLS_PER_PAGE),
+      }),
+      execute: async ({ offset, limit }) => {
         const { env, userId } = await requireAdmin()
         const tools = createActionTools(env, userId, '')
         const all = await tools.query('restrooms')
@@ -174,8 +179,15 @@ export function buildRestroomAdminTools(): ToolSet {
           if (!r.data.cellKey) missingCell++
           else counts.set(r.data.cellKey, (counts.get(r.data.cellKey) ?? 0) + 1)
         }
-        const cells = [...counts].map(([cellKey, restrooms]) => ({ cellKey, restrooms }))
-        return { cells, restrooms: [...counts.values()].reduce((a, b) => a + b, 0), missingCell }
+        const sorted = [...counts.keys()].sort()
+        const keys = sorted.slice(offset, offset + limit)
+        return {
+          cellKeys: keys,
+          nextOffset: offset + limit < sorted.length ? offset + limit : null,
+          totalCells: sorted.length,
+          totalRestrooms: [...counts.values()].reduce((a, b) => a + b, 0),
+          missingCell,
+        }
       },
     }),
 
