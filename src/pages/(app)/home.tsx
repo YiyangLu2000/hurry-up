@@ -24,7 +24,7 @@ import type {
 } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { useAuthProfileReady } from 'deepspace'
-import { Accessibility, Car, Footprints, Info, Loader2, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
+import { Accessibility, Car, Coffee, Footprints, Info, Loader2, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LocationControl } from '../../components/LocationControl'
 import { RestroomCells, type CellRecords } from '../../components/RestroomCells'
@@ -53,6 +53,8 @@ import {
 import {
   cellForPoint,
   cellsInView,
+  cellsWithinRadius,
+  SEARCH_RADIUS_METERS,
   DEFAULT_CENTER,
   MIN_SEED_ZOOM,
   US_MAX_BOUNDS,
@@ -81,7 +83,7 @@ const START_ZOOM = 14
 const SEED_DEBOUNCE_MS = 700
 const SEED_BACKOFF_BASE_MS = 30_000
 const SEED_BACKOFF_MAX_MS = 10 * 60_000
-const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c' }
+const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c', cafe: '#92400e' }
 const UNAVAILABLE_COLOR = '#9ca3af'
 /** Below this zoom no cells load and restroom markers hide. */
 const MIN_VIEW_ZOOM = 12
@@ -90,7 +92,7 @@ const MAX_VIEW_CELLS = 36
 /** Recently used cells stay subscribed so panning back is instant. */
 const RETAINED_CELLS = 64
 /** Auto-select only picks a restroom this close; farther is not "nearby". */
-const AUTO_SELECT_MAX_METERS = 5000
+const AUTO_SELECT_MAX_METERS = SEARCH_RADIUS_METERS
 /** Auto-select compares walking time for this many straight-line-nearest restrooms. */
 const AUTO_SELECT_CANDIDATES = 6
 /** Past this, auto-select falls back to the straight-line nearest. */
@@ -112,7 +114,7 @@ const markerColor = [
   'case',
   ['!=', ['get', 'status'], 'active'],
   UNAVAILABLE_COLOR,
-  ['match', ['get', 'kind'], 'restaurant', KIND_COLOR.restaurant, KIND_COLOR.public],
+  ['match', ['get', 'kind'], 'restaurant', KIND_COLOR.restaurant, 'cafe', KIND_COLOR.cafe, KIND_COLOR.public],
 ] as ExpressionSpecification
 
 type RestroomRecord = CellRecords['records'][number]
@@ -125,7 +127,7 @@ const GENDER_LABEL: Record<GenderType, string> = {
   'gender-neutral': 'Gender-neutral',
   unknown: 'Unknown',
 }
-const KIND_LABEL: Record<RestroomKind, string> = { public: 'Public', restaurant: 'Restaurant' }
+const KIND_LABEL: Record<RestroomKind, string> = { public: 'Public', restaurant: 'Restaurant', cafe: 'Café' }
 
 export default function HomePage() {
   const { user } = useAuthProfileReady({ requireUser: true })
@@ -169,8 +171,15 @@ export default function HomePage() {
   // comparison, shown in its panel without another request.
   // The location the closest-restroom pick last completed for (overlay).
   const [pickedFor, setPickedFor] = useState<string | null>(null)
-  // The location the pick found no restroom in range for (it keeps watching).
-  const [nothingFoundFor, setNothingFoundFor] = useState<string | null>(null)
+  // When the restrooms loaded around a location have nothing within 5 km, the
+  // whole 5 km circle is searched once: its cells are loaded, and the server
+  // seeds what it has not fetched yet (one Overpass request).
+  const [searchAround, setSearchAround] = useState<{
+    key: string
+    point: Point
+    cells: string[]
+    seeding: 'pending' | 'done' | 'failed'
+  } | null>(null)
   const [walkLeg, setWalkLeg] = useState<(NonNullable<WalkLeg> & { recordId: string; fromKey: string }) | null>(null)
   const locationRef = useRef<Point | null>(userLocation)
   const pickingRef = useRef(false)
@@ -431,9 +440,9 @@ export default function HomePage() {
           type: 'circle',
           source: 'restrooms',
           paint: {
-            'circle-radius': ['match', ['get', 'kind'], 'restaurant', 6, 8],
+            'circle-radius': ['match', ['get', 'kind'], ['restaurant', 'cafe'], 6, 8],
             'circle-color': markerColor,
-            'circle-stroke-width': ['match', ['get', 'kind'], 'restaurant', 1.5, 3],
+            'circle-stroke-width': ['match', ['get', 'kind'], ['restaurant', 'cafe'], 1.5, 3],
             'circle-stroke-color': '#ffffff',
           },
         })
@@ -837,6 +846,34 @@ export default function HomePage() {
   const locationCellsReady =
     !zoomedOut && recordsStatus === 'ready' && !!locationCell && subscribedCells.includes(locationCell)
 
+  /** Search the whole 5 km circle around `point` (once per location). */
+  const startSearchAround = useCallback((point: Point, key: string) => {
+    const cells = cellsWithinRadius(point, SEARCH_RADIUS_METERS).map((c) => c.key)
+    setSearchAround({ key, point, cells, seeding: 'pending' })
+    void fetch('/api/restrooms/seed-around', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(point),
+    })
+      .then(
+        (res): 'done' | 'failed' => (res.ok ? 'done' : 'failed'),
+        (): 'failed' => 'failed',
+      )
+      .then((seeding) => setSearchAround((s) => (s && s.key === key ? { ...s, seeding } : s)))
+  }, [])
+  const activeSearch = searchAround && searchAround.key === locationKey ? searchAround : null
+  const searchCellsReady = !!activeSearch && activeSearch.cells.every((k) => cellData.get(k)?.ready)
+  const anyWithinRange =
+    !!userLocation && visible.some((r) => distanceMeters(userLocation, r.data) <= SEARCH_RADIUS_METERS)
+  // The whole circle's restrooms are in and none is in range (seeding of
+  // unfetched cells may still be running — the overlay does not wait for it).
+  const nothingWithin = !!activeSearch && searchCellsReady && !anyWithinRange
+  const filtersActive = kinds.size < RESTROOM_KINDS.length || genders.size < GENDER_TYPES.length
+  const cellKeysToLoad = useMemo(
+    () => (activeSearch ? [...new Set([...subscribedCells, ...activeSearch.cells])] : subscribedCells),
+    [subscribedCells, activeSearch],
+  )
+
   useEffect(() => {
     if (autoSelectDone.current || !userLocation || !mapReady || selectedId) return
     // Pick once the restrooms around the location have loaded from the
@@ -853,7 +890,9 @@ export default function HomePage() {
       .slice(0, AUTO_SELECT_CANDIDATES)
       .map((c) => c.r)
     if (candidates.length === 0) {
-      setNothingFoundFor(locationKey)
+      // Nothing in range among the loaded restrooms: search the whole circle
+      // once for this location (rows that arrive re-run this effect).
+      if (locationKey && searchAround?.key !== locationKey) startSearchAround(userLocation, locationKey)
       return
     }
     // Claim this page load's one auto-select now; nothing is selected until
@@ -888,6 +927,8 @@ export default function HomePage() {
     locationCellsReady,
     visible,
     pickNonce,
+    searchAround,
+    startSearchAround,
   ])
 
   // Escape closes the panel.
@@ -917,14 +958,13 @@ export default function HomePage() {
   })
   const startOverlay = useCallback((kind: OverlayKind) => {
     setPickedFor(null)
-    setNothingFoundFor(null)
     setOverlay({ kind, startedAt: Date.now() })
   }, [])
   const closeOverlay = useCallback(() => setOverlay(null), [])
 
   const cellsReady = zoomedOut || (userLocation ? locationCellsReady : recordsStatus === 'ready')
   const locationPending = !loc.settled || loc.gpsStatus === 'locating'
-  const nothingNearby = !!locationKey && nothingFoundFor === locationKey
+  const nothingNearby = nothingWithin
   const loadingDone = overlayDone({
     mapReady,
     cellsReady,
@@ -1011,7 +1051,7 @@ export default function HomePage() {
       <div className="absolute inset-0">
         <div ref={containerRef} className="h-full w-full" data-testid="restroom-map" />
       </div>
-      <RestroomCells cellKeys={subscribedCells} onReport={onCellReport} />
+      <RestroomCells cellKeys={cellKeysToLoad} onReport={onCellReport} />
 
       {/* Above the details panel: an open location panel must stay usable. */}
       <div className="pointer-events-none absolute inset-x-3 top-3 z-20 flex flex-col gap-2 sm:right-auto sm:w-80">
@@ -1040,6 +1080,30 @@ export default function HomePage() {
             {seedState === 'loading' && ' · loading nearby restrooms…'}
             {tooFarOut && ' · zoom in to load more'}
           </p>
+          {nothingWithin && (
+            <p
+              data-testid="nothing-nearby"
+              role="status"
+              className="mt-2 flex items-center justify-between gap-2 rounded-md bg-muted px-2.5 py-1.5 text-xs"
+            >
+              {activeSearch?.seeding === 'failed' ? (
+                <>
+                  Couldn&apos;t check everything within 5 km.
+                  <button
+                    type="button"
+                    onClick={() => activeSearch && startSearchAround(activeSearch.point, activeSearch.key)}
+                    className="font-medium text-foreground underline underline-offset-2"
+                  >
+                    Retry
+                  </button>
+                </>
+              ) : activeSearch?.seeding === 'pending' ? (
+                'Checking within 5 km…'
+              ) : (
+                `Nothing within 5 km${filtersActive ? ' matching your filters' : ''}.`
+              )}
+            </p>
+          )}
           {seedState === 'error' && (
             <p
               data-testid="seed-error"
@@ -1229,7 +1293,9 @@ function RestroomDetails({
   showAdminInfo: boolean
   onClose: () => void
 }) {
-  const isRestaurant = restroom.kind === 'restaurant'
+  // Restaurants and cafés are businesses: their restroom may be for customers only.
+  const isBusiness = restroom.kind !== 'public'
+  const brandSuffix = restroom.brand ? ` · ${restroom.brand}` : ''
 
   return (
     <section
@@ -1240,7 +1306,11 @@ function RestroomDetails({
         <div>
           <h2 className="text-base font-semibold">{restroom.name}</h2>
           <p className="text-xs text-muted-foreground">
-            {isRestaurant ? `Restaurant${restroom.brand ? ` · ${restroom.brand}` : ''}` : 'Public restroom'}
+            {restroom.kind === 'cafe'
+              ? `Café${brandSuffix}`
+              : restroom.kind === 'restaurant'
+                ? `Restaurant${brandSuffix}`
+                : 'Public restroom'}
           </p>
         </div>
         <button
@@ -1255,7 +1325,13 @@ function RestroomDetails({
 
       <ul className="mt-3 space-y-1.5 text-sm">
         <li className="flex items-center gap-2">
-          {isRestaurant ? <Utensils className="h-4 w-4" /> : <MapPin className="h-4 w-4" />}
+          {restroom.kind === 'cafe' ? (
+            <Coffee className="h-4 w-4" />
+          ) : restroom.kind === 'restaurant' ? (
+            <Utensils className="h-4 w-4" />
+          ) : (
+            <MapPin className="h-4 w-4" />
+          )}
           {GENDER_LABEL[restroom.genderType ?? 'unknown']}
         </li>
         <li className="flex items-center gap-2">
@@ -1265,7 +1341,7 @@ function RestroomDetails({
         </li>
       </ul>
 
-      {isRestaurant && (
+      {isBusiness && (
         <p className="mt-3 flex items-start gap-2 rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">
           <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           May be for customers only.

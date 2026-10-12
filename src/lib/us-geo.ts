@@ -1,3 +1,5 @@
+import { distanceMeters } from './directions'
+
 /**
  * US geography and seeding-grid helpers shared by the worker and the map.
  *
@@ -33,6 +35,9 @@ export const CELL_DEGREES = 0.02
 
 /** Below this zoom the viewport spans too many cells to be worth seeding. */
 export const MIN_SEED_ZOOM = 13
+
+/** How far the closest-restroom search reaches (and "Nothing within 5 km"). */
+export const SEARCH_RADIUS_METERS = 5000
 
 /** Upper bound on cells the client asks for after one map move. */
 export const MAX_SEED_CELLS = 16
@@ -95,4 +100,28 @@ export function cellsInView(
   const distance = (c: Cell) =>
     ((c.south + c.north) / 2 - center.latitude) ** 2 + ((c.west + c.east) / 2 - center.longitude) ** 2
   return cells.sort((a, b) => distance(a) - distance(b)).slice(0, max)
+}
+
+/**
+ * Cells any part of which lies within `meters` of `center` (US cells only),
+ * nearest first. Used to search the whole auto-select range around a
+ * location when the restrooms already loaded have nothing in range.
+ */
+export function cellsWithinRadius(center: { latitude: number; longitude: number }, meters: number): Cell[] {
+  const dLat = meters / 111_320
+  const dLng = meters / (111_320 * Math.cos((center.latitude * Math.PI) / 180))
+  const out: { cell: Cell; d: number }[] = []
+  for (let i = Math.floor((center.latitude - dLat) / CELL_DEGREES); i <= Math.floor((center.latitude + dLat) / CELL_DEGREES); i++) {
+    for (let j = Math.floor((center.longitude - dLng) / CELL_DEGREES); j <= Math.floor((center.longitude + dLng) / CELL_DEGREES); j++) {
+      const cell = cellFromIndex(i, j)
+      // Distance to the cell's nearest point (the centre itself if inside).
+      const nearest = {
+        latitude: Math.min(Math.max(center.latitude, cell.south), cell.north),
+        longitude: Math.min(Math.max(center.longitude, cell.west), cell.east),
+      }
+      const d = distanceMeters(center, nearest)
+      if (d <= meters && cellTouchesUS(cell)) out.push({ cell, d })
+    }
+  }
+  return out.sort((a, b) => a.d - b.d).map((x) => x.cell)
 }

@@ -16,7 +16,8 @@
 
 import type { CollectionSchema } from 'deepspace/schema'
 
-export type RestroomKind = 'public' | 'restaurant'
+/** public toilet, chain fast food, or chain café (the last two may be for customers only). */
+export type RestroomKind = 'public' | 'restaurant' | 'cafe'
 export type GenderType = 'men' | 'women' | 'gender-neutral' | 'unknown'
 export type Wheelchair = 'yes' | 'no' | 'unknown'
 export type RestroomStatus = 'active' | 'unavailable' | 'pending'
@@ -49,7 +50,7 @@ export function normalizeRestroom(row: Restroom): Restroom {
 }
 
 export const GENDER_TYPES: GenderType[] = ['men', 'women', 'gender-neutral', 'unknown']
-export const RESTROOM_KINDS: RestroomKind[] = ['public', 'restaurant']
+export const RESTROOM_KINDS: RestroomKind[] = ['public', 'restaurant', 'cafe']
 
 const NO_WRITES = { create: false, update: false, delete: false } as const
 
@@ -100,6 +101,9 @@ export const restroomAreasSchema: CollectionSchema = {
     // 'import' once the bulk import saved this cell's restrooms: live seeding
     // then never asks Overpass for it again (no 7-day expiry).
     { name: 'coveredBy', storage: 'text', interpretation: { kind: 'select', options: ['import'] } },
+    // Which mapping rules the live fetch used (SEED_RULES_VERSION). A fetch
+    // under older rules (e.g. before cafés) is stale and fetched again.
+    { name: 'rulesVersion', storage: 'number', interpretation: 'plain' },
   ],
   uniqueOn: ['cellKey'],
   permissions: {
