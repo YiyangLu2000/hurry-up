@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ActionTools } from 'deepspace/worker'
-import { cellFromKey } from '../lib/us-geo'
-import { seedCell } from './restroom-seeding'
+import { cellFromKey, cellsWithinRadius } from '../lib/us-geo'
+import { SEED_RULES_VERSION, seedAround, seedCell } from './restroom-seeding'
 
 const NOW = 1_800_000_000
 const DAY = 24 * 60 * 60
@@ -60,17 +60,90 @@ describe('seedCell', () => {
     expect(await seedCell(tools, cell, NOW)).toEqual({ status: 'seeded', found: 1, created: 1 })
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(Object.keys(rows)).toEqual(['osm-node-42'])
-    expect(areas[cell.key]).toMatchObject({ cellKey: cell.key, fetchedAt: NOW, resultCount: 1 })
+    expect(areas[cell.key]).toMatchObject({ cellKey: cell.key, fetchedAt: NOW, resultCount: 1, rulesVersion: SEED_RULES_VERSION })
     expect(areas[cell.key]).not.toHaveProperty('coveredBy')
   })
 
   it('treats a live fetch as fresh for 7 days, then asks Overpass again', async () => {
     const fetchMock = stubOverpass()
-    const fresh = fakeTools({ [cell.key]: { cellKey: cell.key, fetchedAt: NOW - 6 * DAY } })
+    const fresh = fakeTools({ [cell.key]: { cellKey: cell.key, fetchedAt: NOW - 6 * DAY, rulesVersion: SEED_RULES_VERSION } })
     expect((await seedCell(fresh.tools, cell, NOW)).status).toBe('fresh')
     expect(fetchMock).not.toHaveBeenCalled()
-    const stale = fakeTools({ [cell.key]: { cellKey: cell.key, fetchedAt: NOW - 8 * DAY } })
+    const stale = fakeTools({ [cell.key]: { cellKey: cell.key, fetchedAt: NOW - 8 * DAY, rulesVersion: SEED_RULES_VERSION } })
     expect((await seedCell(stale.tools, cell, NOW)).status).toBe('seeded')
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('rules version (cafés added)', () => {
+  it('re-fetches a cell fetched under older rules, even if recent', () => {
+    const fetchMock = stubOverpass()
+    const { tools } = fakeTools({ [cell.key]: { cellKey: cell.key, fetchedAt: NOW - 1 * DAY } }) // no rulesVersion: before cafés
+    return seedCell(tools, cell, NOW).then((r) => {
+      expect(r.status).toBe('seeded')
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('asks Overpass for chain cafés too', async () => {
+    const fetchMock = stubOverpass()
+    const { tools } = fakeTools()
+    await seedCell(tools, cell, NOW)
+    const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1]
+    expect(String(init.body)).toContain(encodeURIComponent('nwr["amenity"="cafe"]["brand"]').replace(/%20/g, '+'))
+  })
+})
+
+describe('seedAround', () => {
+  const around = cellsWithinRadius({ latitude: 40.9642503, longitude: -73.1283089 }, 5000)
+
+  it('covers the whole 5 km range around a point', () => {
+    expect(around.length).toBeGreaterThan(30)
+    expect(around[0].key).toBe('2048_-3657') // the cell of the point comes first
+    expect(around.map((c) => c.key)).toEqual(expect.arrayContaining(['2046_-3657', '2045_-3657']))
+  })
+
+  it('fetches every stale cell with ONE Overpass request and marks them after saving', async () => {
+    const fetchMock = stubOverpass()
+    const { tools, areas } = fakeTools()
+    const r = await seedAround(tools, around, NOW)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(r).toMatchObject({ status: 'seeded', cells: around.length, fetched: around.length })
+    expect(Object.keys(areas)).toHaveLength(around.length)
+    expect(Object.values(areas).every((a) => a.rulesVersion === SEED_RULES_VERSION)).toBe(true)
+  })
+
+  it('makes no Overpass call when every cell is covered or fresh', async () => {
+    const fetchMock = stubOverpass()
+    const marks = Object.fromEntries(
+      around.map((c, i) => [
+        c.key,
+        i % 2 ? { cellKey: c.key, coveredBy: 'import', fetchedAt: 0 } : { cellKey: c.key, fetchedAt: NOW, rulesVersion: SEED_RULES_VERSION },
+      ]),
+    )
+    const { tools } = fakeTools(marks)
+    expect(await seedAround(tools, around, NOW)).toEqual({ status: 'fresh', cells: around.length })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('query', () => {
+  it('uses a plain bounding box (no Overpass area filter, which can fail silently as empty)', async () => {
+    const fetchMock = stubOverpass()
+    const { tools } = fakeTools()
+    await seedCell(tools, cell, NOW)
+    const body = decodeURIComponent(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body).replace(/\+/g, ' '))
+    expect(body).not.toContain('area[')
+    expect(body).not.toContain('area.us')
+  })
+
+  it('keeps US-only on our side: elements outside the US are not saved', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      elements: [{ type: 'node', id: 7, lat: 32.51, lon: -117.0, tags: { amenity: 'toilets' } }], // Tijuana
+    }))))
+    const { tools, rows } = fakeTools()
+    const r = await seedCell(tools, cell, NOW)
+    expect(r).toMatchObject({ status: 'seeded', found: 0 })
+    expect(Object.keys(rows)).toHaveLength(0)
   })
 })

@@ -24,7 +24,7 @@ import type {
 } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import { useAuthProfileReady } from 'deepspace'
-import { Accessibility, Car, Footprints, Info, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
+import { Accessibility, Car, Coffee, Footprints, Info, Loader2, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LocationControl } from '../../components/LocationControl'
 import { RestroomCells, type CellRecords } from '../../components/RestroomCells'
@@ -51,13 +51,24 @@ import {
   type WalkLeg,
 } from '../../lib/routing'
 import {
+  cellForPoint,
   cellsInView,
+  cellsWithinRadius,
+  SEARCH_RADIUS_METERS,
   DEFAULT_CENTER,
   MIN_SEED_ZOOM,
   US_MAX_BOUNDS,
 } from '../../lib/us-geo'
 import type { ManualLocation, Point } from '../../lib/location'
 import { isInUSOutline } from '../../lib/us-outline'
+import { OVERLAY_CAP_MS, overlayDone, type OverlayKind } from '../../lib/loading-overlay'
+import {
+  canRouteFrom,
+  onOriginChange,
+  originKeyOf,
+  routeForOrigin,
+  type RouteTarget,
+} from '../../lib/route-origin'
 import { useUserLocation } from '../../lib/use-user-location'
 import {
   GENDER_TYPES,
@@ -72,9 +83,8 @@ const START_ZOOM = 14
 const SEED_DEBOUNCE_MS = 700
 const SEED_BACKOFF_BASE_MS = 30_000
 const SEED_BACKOFF_MAX_MS = 10 * 60_000
-const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c' }
+const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c', cafe: '#92400e' }
 const UNAVAILABLE_COLOR = '#9ca3af'
-const AUTO_SELECT_WAIT_MS = 5000
 /** Below this zoom no cells load and restroom markers hide. */
 const MIN_VIEW_ZOOM = 12
 /** Cells subscribed for one view, nearest the centre first. */
@@ -82,7 +92,7 @@ const MAX_VIEW_CELLS = 36
 /** Recently used cells stay subscribed so panning back is instant. */
 const RETAINED_CELLS = 64
 /** Auto-select only picks a restroom this close; farther is not "nearby". */
-const AUTO_SELECT_MAX_METERS = 5000
+const AUTO_SELECT_MAX_METERS = SEARCH_RADIUS_METERS
 /** Auto-select compares walking time for this many straight-line-nearest restrooms. */
 const AUTO_SELECT_CANDIDATES = 6
 /** Past this, auto-select falls back to the straight-line nearest. */
@@ -100,17 +110,11 @@ const OSM_ATTRIBUTION =
   '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>'
 /** Beyond this straight-line distance no route is requested (heavy for the service). */
 const MAX_ROUTE_METERS = 50_000
-/**
- * Moving your location further than this starts fresh: the old selection and
- * route (chosen for the old spot) are dropped so the map centres on the new
- * one. Smaller corrections keep them.
- */
-const RELOCATE_RESET_METERS = 300
 const markerColor = [
   'case',
   ['!=', ['get', 'status'], 'active'],
   UNAVAILABLE_COLOR,
-  ['match', ['get', 'kind'], 'restaurant', KIND_COLOR.restaurant, KIND_COLOR.public],
+  ['match', ['get', 'kind'], 'restaurant', KIND_COLOR.restaurant, 'cafe', KIND_COLOR.cafe, KIND_COLOR.public],
 ] as ExpressionSpecification
 
 type RestroomRecord = CellRecords['records'][number]
@@ -123,7 +127,7 @@ const GENDER_LABEL: Record<GenderType, string> = {
   'gender-neutral': 'Gender-neutral',
   unknown: 'Unknown',
 }
-const KIND_LABEL: Record<RestroomKind, string> = { public: 'Public', restaurant: 'Restaurant' }
+const KIND_LABEL: Record<RestroomKind, string> = { public: 'Public', restaurant: 'Restaurant', cafe: 'Café' }
 
 export default function HomePage() {
   const { user } = useAuthProfileReady({ requireUser: true })
@@ -151,17 +155,11 @@ export default function HomePage() {
   const [tooFarOut, setTooFarOut] = useState(false)
   const loc = useUserLocation()
   const userLocation = loc.location
+  /** The current origin: every route is tied to the origin it was requested from. */
+  const locationKey = originKeyOf(userLocation)
   const [picking, setPicking] = useState(false)
   const [pickError, setPickError] = useState<string | null>(null)
   const [seedState, setSeedState] = useState<'idle' | 'loading' | 'error'>('idle')
-  // Completed seeding passes; auto-select waits for one that started after the
-  // location became known (or a timeout), so nearby rows have arrived.
-  const [seedPasses, setSeedPasses] = useState(0)
-  const [autoSelectWait, setAutoSelectWait] = useState<{
-    key: string
-    pass: number
-    expired: boolean
-  } | null>(null)
   // Once per page load: set after the auto-selection, or when the user
   // selects, closes, pans, or filters while their location is known.
   const autoSelectDone = useRef(false)
@@ -171,13 +169,22 @@ export default function HomePage() {
   const autoSelectInterrupted = useRef(false)
   // Walking duration/distance of the auto-selected restroom, from the
   // comparison, shown in its panel without another request.
+  // The location the closest-restroom pick last completed for (overlay).
+  const [pickedFor, setPickedFor] = useState<string | null>(null)
+  // When the restrooms loaded around a location have nothing within 5 km, the
+  // whole 5 km circle is searched once: its cells are loaded, and the server
+  // seeds what it has not fetched yet (one Overpass request).
+  const [searchAround, setSearchAround] = useState<{
+    key: string
+    point: Point
+    cells: string[]
+    seeding: 'pending' | 'done' | 'failed'
+  } | null>(null)
   const [walkLeg, setWalkLeg] = useState<(NonNullable<WalkLeg> & { recordId: string; fromKey: string }) | null>(null)
   const locationRef = useRef<Point | null>(userLocation)
-  const seedPassesRef = useRef(0)
   const pickingRef = useRef(false)
   useEffect(() => {
     locationRef.current = userLocation
-    seedPassesRef.current = seedPasses
     pickingRef.current = picking
   })
   // Seeding stays closed until the first location answer (or a timeout), so a
@@ -192,10 +199,17 @@ export default function HomePage() {
 
   // Routing. The route target is the last selected restroom; it outlives the
   // panel. `route` is what is drawn: a real route, or a straight fallback.
-  const [routeTargetId, setRouteTargetId] = useState<string | null>(null)
+  // The route destination, with the origin it was chosen from (rule 3).
+  const [routeTargetState, setRouteTargetState] = useState<RouteTarget | null>(null)
+  const routeTargetId = routeTargetState?.id ?? null
+  /** Set the route destination, remembering the current origin with it. */
+  const setRouteTargetId = (id: string | null) =>
+    setRouteTargetState(id ? { id, originKey: locationKey } : null)
   const [travelMode, setTravelMode] = useState<TravelMode>('walk')
   const [route, setRoute] = useState<{
     key: string
+    /** The origin this route was requested from (see src/lib/route-origin.ts). */
+    originKey: string
     targetId: string
     mode: TravelMode
     result: Route | { kind: 'fallback'; coordinates: LineCoords }
@@ -224,6 +238,8 @@ export default function HomePage() {
   }
   const selected = lookup(selectedId)
   const routeTarget = lookup(routeTargetId)
+  // Only a route requested from the current origin is ever drawn or shown.
+  const drawnRoute = routeForOrigin(route, locationKey)
   useEffect(() => {
     const keep = new Map<string, RestroomRecord>()
     for (const id of [selectedId, routeTargetId]) {
@@ -275,22 +291,13 @@ export default function HomePage() {
 
   /**
    * Set the visitor's location by hand (map tap or typed). The map moves to
-   * it at a zoom where restrooms load, so the ones around it appear. A real
-   * move (or one with no route showing) starts over: the old selection and
-   * route go, and the closest restroom to the new spot is selected and
-   * routed to once the restrooms around it have loaded.
+   * it at a zoom where restrooms load, so the ones around it appear. The new
+   * origin discards the old route and selection and starts a new closest-
+   * restroom pick (the origin-change effect below).
    */
   const setManual = loc.setManual
   const setManualLocation = useCallback(
     (p: ManualLocation) => {
-      const previous = locationRef.current
-      const moved = !previous || distanceMeters(p, previous) > RELOCATE_RESET_METERS
-      if (moved || !routeTargetIdRef.current) {
-        setRouteTargetId(null)
-        setSelectedId(null)
-        autoSelectAbort.current?.abort()
-        autoSelectDone.current = false
-      }
       setManual(p)
       // Arriving there fires moveend, which seeds the cells around it.
       mapRef.current?.easeTo({
@@ -334,10 +341,8 @@ export default function HomePage() {
       rerun.current = true
       return
     }
-    const passDone = () => setSeedPasses((n) => n + 1)
     if (map.getZoom() < MIN_SEED_ZOOM) {
       setTooFarOut(true)
-      passDone()
       return
     }
     setTooFarOut(false)
@@ -353,7 +358,6 @@ export default function HomePage() {
       return force || !wait || wait.retryAt <= now
     })
     if (cells.length === 0) {
-      passDone()
       return
     }
 
@@ -392,7 +396,6 @@ export default function HomePage() {
     }
     running.current = false
     setSeedState(failed ? 'error' : 'idle')
-    passDone()
     if (rerun.current && !failed) {
       rerun.current = false
       void seedView()
@@ -437,9 +440,9 @@ export default function HomePage() {
           type: 'circle',
           source: 'restrooms',
           paint: {
-            'circle-radius': ['match', ['get', 'kind'], 'restaurant', 6, 8],
+            'circle-radius': ['match', ['get', 'kind'], ['restaurant', 'cafe'], 6, 8],
             'circle-color': markerColor,
-            'circle-stroke-width': ['match', ['get', 'kind'], 'restaurant', 1.5, 3],
+            'circle-stroke-width': ['match', ['get', 'kind'], ['restaurant', 'cafe'], 1.5, 3],
             'circle-stroke-color': '#ffffff',
           },
         })
@@ -673,7 +676,7 @@ export default function HomePage() {
     if (!map) return
     const id = selectedId ?? ''
     // The destination ring shows only while its restroom is not selected.
-    const dest = routeTargetId && routeTargetId !== selectedId && route ? routeTargetId : ''
+    const dest = routeTargetId && routeTargetId !== selectedId && drawnRoute ? routeTargetId : ''
     map.setFilter('restrooms', ['all', ['!=', ['get', 'id'], id], ['!=', ['get', 'id'], dest]])
     map.setFilter('restroom-destination', ['==', ['get', 'id'], dest])
     map.setFilter('restroom-halo', ['==', ['get', 'id'], id])
@@ -691,7 +694,7 @@ export default function HomePage() {
       frame = requestAnimationFrame(pulse)
     })
     return () => cancelAnimationFrame(frame)
-  }, [selectedId, routeTargetId, route, mapReady])
+  }, [selectedId, routeTargetId, drawnRoute, mapReady])
 
   // A selection becomes the route target; closing the panel keeps the target.
   useEffect(() => {
@@ -706,12 +709,17 @@ export default function HomePage() {
   const toLng = routeTarget?.data.longitude
   const fitPending = useRef(false)
   useEffect(() => {
-    if (!routeTargetId || fromLat === undefined || fromLng === undefined) {
+    // Only to a destination chosen from this same origin: in the render where
+    // the origin changes, the old destination is still set until the
+    // origin-change effect drops it, and must not get a route (or a straight
+    // fallback line) from the new origin.
+    if (!canRouteFrom(routeTargetState, locationKey) || fromLat === undefined || fromLng === undefined) {
       setRoute(null)
       setRoutePending(false)
       return
     }
     if (toLat === undefined || toLng === undefined) return
+    const target = routeTargetState
     const from = { latitude: fromLat, longitude: fromLng }
     const to = { latitude: toLat, longitude: toLng }
     const key = routeKey(travelMode, from, to)
@@ -726,7 +734,8 @@ export default function HomePage() {
         fitPending.current = true
         setRoute({
           key,
-          targetId: routeTargetId,
+          originKey: originKeyOf(from)!,
+          targetId: target.id,
           mode: travelMode,
           result: result ?? {
             kind: 'fallback',
@@ -742,7 +751,7 @@ export default function HomePage() {
         // Aborted: a newer request owns the state.
       })
     return () => controller.abort()
-  }, [routeTargetId, travelMode, fromLat, fromLng, toLat, toLng])
+  }, [routeTargetId, routeTargetState, locationKey, travelMode, fromLat, fromLng, toLat, toLng])
 
   // Draw the route, and fit it into view when a new one arrives. Closing the
   // panel does not produce a new route, so it never moves the map.
@@ -754,11 +763,11 @@ export default function HomePage() {
       geometry: { type: 'LineString' as const, coordinates },
       properties: { kind },
     })
-    const features = route ? [line(route.result.coordinates, route.result.kind)] : []
+    const features = drawnRoute ? [line(drawnRoute.result.coordinates, drawnRoute.result.kind)] : []
     // A real route starts and ends on the nearest road; dashed connectors
     // join it to the visitor and the restroom when the gap is noticeable.
-    if (route?.result.kind === 'route' && userLocation && routeTarget) {
-      const coords = route.result.coordinates
+    if (drawnRoute?.result.kind === 'route' && userLocation && routeTarget) {
+      const coords = drawnRoute.result.coordinates
       const ends: [Point, [number, number]][] = [
         [userLocation, coords[0]],
         [routeTarget.data, coords[coords.length - 1]],
@@ -770,9 +779,9 @@ export default function HomePage() {
       }
     }
     map.getSource<GeoJSONSource>('route')?.setData({ type: 'FeatureCollection', features })
-    if (!route || !fitPending.current) return
+    if (!drawnRoute || !fitPending.current) return
     fitPending.current = false
-    const coords = route.result.coordinates
+    const coords = drawnRoute.result.coordinates
     const lngs = coords.map((c) => c[0])
     const lats = coords.map((c) => c[1])
     const wide = window.innerWidth >= 640
@@ -791,12 +800,11 @@ export default function HomePage() {
       },
     )
     // userLocation/routeTarget only shape the connectors; a new route is what fits.
-  }, [route, mapReady, userLocation, routeTarget])
+  }, [drawnRoute, mapReady, userLocation, routeTarget])
 
   // Auto-select the nearest matching restroom, once per page load, when a
   // location (GPS or set on the map) becomes known. It waits for a seeding
   // pass that started afterwards, or a few seconds, so nearby rows are in.
-  const locationKey = userLocation ? `${userLocation.latitude},${userLocation.longitude}` : null
   const selectedIdRef = useRef<string | null>(null)
   const locationKeyRef = useRef<string | null>(null)
   useEffect(() => {
@@ -804,35 +812,89 @@ export default function HomePage() {
     locationKeyRef.current = locationKey
   })
   useEffect(() => () => autoSelectAbort.current?.abort(), [])
+  // Rule: a route belongs to its origin. When the origin changes (recenter,
+  // typed or tapped location), the old route, destination and selection are
+  // discarded and the closest-restroom pick runs again from the new origin.
+  // Drawing is already gated by routeForOrigin, so nothing stale is drawn
+  // even in the render before this runs.
+  const originRef = useRef<string | null>(locationKey)
   useEffect(() => {
-    if (!locationKey || autoSelectDone.current) return
-    setAutoSelectWait({ key: locationKey, pass: seedPassesRef.current, expired: false })
-    const timer = setTimeout(
-      () => setAutoSelectWait((w) => (w && w.key === locationKey ? { ...w, expired: true } : w)),
-      AUTO_SELECT_WAIT_MS,
+    const previous = originRef.current
+    originRef.current = locationKey
+    if (previous === locationKey || previous === null) return // first location: nothing chosen yet
+    const next = onOriginChange(
+      { originKey: previous, targetId: routeTargetIdRef.current, selectedId: selectedIdRef.current },
+      locationKey,
     )
-    return () => clearTimeout(timer)
+    setRouteTargetId(next.targetId)
+    setSelectedId(next.selectedId)
+    setRoute(null)
+    setWalkLeg(null)
+    autoSelectAbort.current?.abort()
+    autoSelectDone.current = false
+    autoSelectInterrupted.current = false
   }, [locationKey])
+
+  // Bumped by "Recenter on me" to run the pick again even when the origin
+  // itself does not change (already on the device location).
+  const [pickNonce, setPickNonce] = useState(0)
+
+  // The cell under the current location has its restrooms. The pick (and the
+  // loading overlay) wait for this — never for live seeding: right after a
+  // move the old area's cells are still "ready", hence the location cell.
+  const locationCell = userLocation ? cellForPoint(userLocation.latitude, userLocation.longitude).key : null
+  const locationCellsReady =
+    !zoomedOut && recordsStatus === 'ready' && !!locationCell && subscribedCells.includes(locationCell)
+
+  /** Search the whole 5 km circle around `point` (once per location). */
+  const startSearchAround = useCallback((point: Point, key: string) => {
+    const cells = cellsWithinRadius(point, SEARCH_RADIUS_METERS).map((c) => c.key)
+    setSearchAround({ key, point, cells, seeding: 'pending' })
+    void fetch('/api/restrooms/seed-around', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(point),
+    })
+      .then(
+        (res): 'done' | 'failed' => (res.ok ? 'done' : 'failed'),
+        (): 'failed' => 'failed',
+      )
+      .then((seeding) => setSearchAround((s) => (s && s.key === key ? { ...s, seeding } : s)))
+  }, [])
+  const activeSearch = searchAround && searchAround.key === locationKey ? searchAround : null
+  const searchCellsReady = !!activeSearch && activeSearch.cells.every((k) => cellData.get(k)?.ready)
+  const anyWithinRange =
+    !!userLocation && visible.some((r) => distanceMeters(userLocation, r.data) <= SEARCH_RADIUS_METERS)
+  // The whole circle's restrooms are in and none is in range (seeding of
+  // unfetched cells may still be running — the overlay does not wait for it).
+  const nothingWithin = !!activeSearch && searchCellsReady && !anyWithinRange
+  const filtersActive = kinds.size < RESTROOM_KINDS.length || genders.size < GENDER_TYPES.length
+  const cellKeysToLoad = useMemo(
+    () => (activeSearch ? [...new Set([...subscribedCells, ...activeSearch.cells])] : subscribedCells),
+    [subscribedCells, activeSearch],
+  )
 
   useEffect(() => {
     if (autoSelectDone.current || !userLocation || !mapReady || selectedId) return
-    if (recordsStatus !== 'ready' || visible.length === 0) return
-    const wait = autoSelectWait
-    if (!wait || wait.key !== locationKey) return
-    // A seeding pass that finished after the location was set (or the timeout):
-    // judging "closest" earlier could miss restrooms still loading nearby.
-    const seeded = seedState !== 'loading' && seedPasses > wait.pass
-    if (!seeded && !wait.expired) return
+    // Pick once the restrooms around the location have loaded from the
+    // database. Live seeding is not awaited: in imported areas it adds
+    // nothing, and elsewhere new rows re-run this effect as they arrive.
+    if (!locationCellsReady) return
     // Candidates: the nearest restrooms in a straight line, within range.
-    // None nearby loaded yet: keep waiting for seeding (or until the user
-    // interacts) rather than selecting something across the country.
+    // None nearby loaded yet: keep watching (rows from live seeding re-run
+    // this) rather than selecting something across the country.
     const candidates = visible
       .map((r) => ({ r, d: distanceMeters(userLocation, r.data) }))
       .filter((c) => c.d <= AUTO_SELECT_MAX_METERS)
       .sort((a, b) => a.d - b.d)
       .slice(0, AUTO_SELECT_CANDIDATES)
       .map((c) => c.r)
-    if (candidates.length === 0) return
+    if (candidates.length === 0) {
+      // Nothing in range among the loaded restrooms: search the whole circle
+      // once for this location (rows that arrive re-run this effect).
+      if (locationKey && searchAround?.key !== locationKey) startSearchAround(userLocation, locationKey)
+      return
+    }
     // Claim this page load's one auto-select now; nothing is selected until
     // the walking-time comparison answers (or times out).
     autoSelectDone.current = true
@@ -852,6 +914,7 @@ export default function HomePage() {
         const leg = legs?.[index]
         setWalkLeg(leg ? { ...leg, recordId: chosen.recordId, fromKey } : null)
         setSelectedId(chosen.recordId)
+        setPickedFor(fromKey)
         const map = mapRef.current
         const at: [number, number] = [chosen.data.longitude, chosen.data.latitude]
         if (map && !map.getBounds().contains(at)) map.easeTo({ center: at })
@@ -861,17 +924,17 @@ export default function HomePage() {
     locationKey,
     mapReady,
     selectedId,
-    recordsStatus,
+    locationCellsReady,
     visible,
-    autoSelectWait,
-    seedState,
-    seedPasses,
+    pickNonce,
+    searchAround,
+    startSearchAround,
   ])
 
   // Escape closes the panel.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return
+      if (e.key !== 'Escape' || overlayRef.current) return
       if (pickingRef.current) {
         setPicking(false)
         setPickError(null)
@@ -880,6 +943,92 @@ export default function HomePage() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [select])
+
+  // ---------------------------------------------------------------------------
+  // Blocking loading overlay: first load (cap 5 s) and re-picks after
+  // "Recenter on me" or a typed location (cap 3 s). See src/lib/loading-overlay.ts.
+  // ---------------------------------------------------------------------------
+  const [overlay, setOverlay] = useState<{ kind: OverlayKind; startedAt: number } | null>(() => ({
+    kind: 'initial',
+    startedAt: Date.now(),
+  }))
+  const overlayRef = useRef(overlay)
+  useEffect(() => {
+    overlayRef.current = overlay
+  })
+  const startOverlay = useCallback((kind: OverlayKind) => {
+    setPickedFor(null)
+    setOverlay({ kind, startedAt: Date.now() })
+  }, [])
+  const closeOverlay = useCallback(() => setOverlay(null), [])
+
+  const cellsReady = zoomedOut || (userLocation ? locationCellsReady : recordsStatus === 'ready')
+  const locationPending = !loc.settled || loc.gpsStatus === 'locating'
+  const nothingNearby = nothingWithin
+  const loadingDone = overlayDone({
+    mapReady,
+    cellsReady,
+    hasLocation: !!userLocation,
+    locationPending,
+    picked: !!locationKey && pickedFor === locationKey,
+    selected: !!selectedId,
+    routeDrawn: !!selectedId && drawnRoute?.targetId === selectedId,
+    nothingNearby,
+  })
+  // Close when everything is in…
+  useEffect(() => {
+    if (overlay && loadingDone) setOverlay(null)
+  }, [overlay, loadingDone])
+  // …or at the cap, whatever is still pending (it keeps loading behind).
+  useEffect(() => {
+    if (!overlay) return
+    const left = overlay.startedAt + OVERLAY_CAP_MS[overlay.kind] - Date.now()
+    const timer = setTimeout(() => setOverlay(null), Math.max(0, left))
+    return () => clearTimeout(timer)
+  }, [overlay])
+  // Focus: into the overlay while it is up; back to the map when it closes.
+  const overlayBoxRef = useRef<HTMLDivElement>(null)
+  const hadOverlay = useRef(false)
+  useEffect(() => {
+    if (overlay) {
+      overlayBoxRef.current?.focus()
+      hadOverlay.current = true
+    } else if (hadOverlay.current) {
+      hadOverlay.current = false
+      mapRef.current?.getCanvas().focus()
+    }
+  }, [overlay])
+  const askingForLocation =
+    !userLocation && locationPending && loc.permission !== 'granted' && loc.permission !== 'denied'
+
+  /**
+   * "Recenter on me": back to the device location (dropping any typed one),
+   * centred there, old route and destination gone, and the closest-restroom
+   * pick run again exactly as on first load — the one allowed exception to
+   * once-per-page-load, because the visitor asked. False when the device
+   * location is unavailable; then nothing changes.
+   */
+  const clearManual = loc.clearManual
+  const recenterOnMe = useCallback((): boolean => {
+    const gps = loc.gps
+    if (!gps) return false
+    setRouteTargetId(null)
+    setSelectedId(null)
+    setRoute(null)
+    setWalkLeg(null)
+    autoSelectAbort.current?.abort()
+    autoSelectDone.current = false
+    autoSelectInterrupted.current = false
+    clearManual()
+    setPickNonce((n) => n + 1)
+    startOverlay('repick')
+    mapRef.current?.easeTo({
+      center: [gps.longitude, gps.latitude],
+      zoom: Math.max(START_ZOOM, MIN_SEED_ZOOM),
+      duration: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 800,
+    })
+    return true
+  }, [loc.gps, clearManual, startOverlay])
 
   const toggle = <T,>(set: Set<T>, value: T, update: (next: Set<T>) => void) => {
     const next = new Set(set)
@@ -894,13 +1043,15 @@ export default function HomePage() {
 
   return (
     <div className="relative h-full w-full">
+      {/* While the loading overlay is up, nothing behind it takes clicks, typing or focus. */}
+      <div className="absolute inset-0" inert={!!overlay}>
       {/* maplibre's unlayered `.maplibregl-map { position: relative }` beats
           Tailwind's layered utilities, so the map element itself must not rely
           on `absolute inset-0` for its size — the wrapper provides it. */}
       <div className="absolute inset-0">
         <div ref={containerRef} className="h-full w-full" data-testid="restroom-map" />
       </div>
-      <RestroomCells cellKeys={subscribedCells} onReport={onCellReport} />
+      <RestroomCells cellKeys={cellKeysToLoad} onReport={onCellReport} />
 
       {/* Above the details panel: an open location panel must stay usable. */}
       <div className="pointer-events-none absolute inset-x-3 top-3 z-20 flex flex-col gap-2 sm:right-auto sm:w-80">
@@ -929,6 +1080,30 @@ export default function HomePage() {
             {seedState === 'loading' && ' · loading nearby restrooms…'}
             {tooFarOut && ' · zoom in to load more'}
           </p>
+          {nothingWithin && (
+            <p
+              data-testid="nothing-nearby"
+              role="status"
+              className="mt-2 flex items-center justify-between gap-2 rounded-md bg-muted px-2.5 py-1.5 text-xs"
+            >
+              {activeSearch?.seeding === 'failed' ? (
+                <>
+                  Couldn&apos;t check everything within 5 km.
+                  <button
+                    type="button"
+                    onClick={() => activeSearch && startSearchAround(activeSearch.point, activeSearch.key)}
+                    className="font-medium text-foreground underline underline-offset-2"
+                  >
+                    Retry
+                  </button>
+                </>
+              ) : activeSearch?.seeding === 'pending' ? (
+                'Checking within 5 km…'
+              ) : (
+                `Nothing within 5 km${filtersActive ? ' matching your filters' : ''}.`
+              )}
+            </p>
+          )}
           {seedState === 'error' && (
             <p
               data-testid="seed-error"
@@ -957,18 +1132,17 @@ export default function HomePage() {
           onChoosePlace={(place) => {
             setPickError(null)
             setPicking(false)
+            startOverlay('repick')
             setManualLocation(place)
           }}
           onCancelPick={() => {
             setPickError(null)
             setPicking(false)
           }}
-          onRecenter={() => {
-            if (loc.gps) mapRef.current?.easeTo({ center: [loc.gps.longitude, loc.gps.latitude] })
-          }}
+          onRecenter={recenterOnMe}
         />
 
-        {route && (
+        {drawnRoute && (
           <button
             type="button"
             data-testid="clear-route"
@@ -986,6 +1160,9 @@ export default function HomePage() {
           id={selected.recordId}
           restroom={selected.data}
           userLocation={userLocation}
+          // A location the visitor set themselves is the start of the
+          // Apple/Google directions; with GPS the maps app uses the device.
+          directionsFrom={loc.source === 'manual' ? userLocation : null}
           travelMode={travelMode}
           onTravelModeChange={(mode) => {
             setTravelMode(mode)
@@ -994,7 +1171,9 @@ export default function HomePage() {
           }}
           route={(() => {
             const own =
-              route && route.targetId === selected.recordId && route.mode === travelMode ? route.result : null
+              drawnRoute && drawnRoute.targetId === selected.recordId && drawnRoute.mode === travelMode
+                ? drawnRoute.result
+                : null
             if (own?.kind === 'route') return own
             // The auto-select comparison already measured this walk.
             const measured =
@@ -1010,6 +1189,47 @@ export default function HomePage() {
           showAdminInfo={isAdmin}
           onClose={() => select(null)}
         />
+      )}
+      </div>
+
+      {overlay && (
+        <div
+          ref={overlayBoxRef}
+          tabIndex={-1}
+          role="dialog"
+          aria-modal="true"
+          aria-busy="true"
+          aria-labelledby="loading-overlay-message"
+          data-testid="loading-overlay"
+          data-kind={overlay.kind}
+          className="absolute inset-0 z-30 flex items-center justify-center bg-background/70 px-4 outline-none backdrop-blur-[2px]"
+        >
+          <div className="w-full max-w-xs rounded-lg border border-border bg-card p-5 text-center text-card-foreground shadow-card">
+            <Loader2 aria-hidden="true" className="mx-auto h-6 w-6 animate-spin text-primary" />
+            <p id="loading-overlay-message" role="status" aria-live="polite" className="mt-3 text-sm font-medium">
+              {askingForLocation
+                ? 'Waiting for your location…'
+                : overlay.kind === 'repick'
+                  ? 'Finding the closest restroom…'
+                  : 'Finding restrooms near you…'}
+            </p>
+            {askingForLocation && (
+              <>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Answer your browser&apos;s location prompt, or continue without it.
+                </p>
+                <button
+                  type="button"
+                  data-testid="continue-without-location"
+                  onClick={closeOverlay}
+                  className="mt-3 rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-muted"
+                >
+                  Continue without location
+                </button>
+              </>
+            )}
+          </div>
+        </div>
       )}
     </div>
   )
@@ -1059,6 +1279,7 @@ function RestroomDetails({
   id,
   restroom,
   userLocation,
+  directionsFrom,
   travelMode,
   onTravelModeChange,
   route,
@@ -1069,6 +1290,8 @@ function RestroomDetails({
   id: string
   restroom: Restroom
   userLocation: { latitude: number; longitude: number } | null
+  /** Start of the Apple/Google directions; null = the device's own location. */
+  directionsFrom: { latitude: number; longitude: number } | null
   travelMode: TravelMode
   onTravelModeChange: (mode: TravelMode) => void
   route: RouteSummary | { kind: 'fallback' } | null
@@ -1076,7 +1299,9 @@ function RestroomDetails({
   showAdminInfo: boolean
   onClose: () => void
 }) {
-  const isRestaurant = restroom.kind === 'restaurant'
+  // Restaurants and cafés are businesses: their restroom may be for customers only.
+  const isBusiness = restroom.kind !== 'public'
+  const brandSuffix = restroom.brand ? ` · ${restroom.brand}` : ''
 
   return (
     <section
@@ -1087,7 +1312,11 @@ function RestroomDetails({
         <div>
           <h2 className="text-base font-semibold">{restroom.name}</h2>
           <p className="text-xs text-muted-foreground">
-            {isRestaurant ? `Restaurant${restroom.brand ? ` · ${restroom.brand}` : ''}` : 'Public restroom'}
+            {restroom.kind === 'cafe'
+              ? `Café${brandSuffix}`
+              : restroom.kind === 'restaurant'
+                ? `Restaurant${brandSuffix}`
+                : 'Public restroom'}
           </p>
         </div>
         <button
@@ -1102,7 +1331,13 @@ function RestroomDetails({
 
       <ul className="mt-3 space-y-1.5 text-sm">
         <li className="flex items-center gap-2">
-          {isRestaurant ? <Utensils className="h-4 w-4" /> : <MapPin className="h-4 w-4" />}
+          {restroom.kind === 'cafe' ? (
+            <Coffee className="h-4 w-4" />
+          ) : restroom.kind === 'restaurant' ? (
+            <Utensils className="h-4 w-4" />
+          ) : (
+            <MapPin className="h-4 w-4" />
+          )}
           {GENDER_LABEL[restroom.genderType ?? 'unknown']}
         </li>
         <li className="flex items-center gap-2">
@@ -1112,7 +1347,7 @@ function RestroomDetails({
         </li>
       </ul>
 
-      {isRestaurant && (
+      {isBusiness && (
         <p className="mt-3 flex items-start gap-2 rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">
           <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           May be for customers only.
@@ -1122,6 +1357,7 @@ function RestroomDetails({
       <Directions
         restroom={restroom}
         userLocation={userLocation}
+        directionsFrom={directionsFrom}
         travelMode={travelMode}
         onTravelModeChange={onTravelModeChange}
         route={route}
@@ -1144,6 +1380,7 @@ const APPLE_DEVICE = typeof navigator !== 'undefined' && isAppleDevice(navigator
 function Directions({
   restroom,
   userLocation,
+  directionsFrom,
   travelMode,
   onTravelModeChange,
   route,
@@ -1151,6 +1388,7 @@ function Directions({
 }: {
   restroom: Restroom
   userLocation: { latitude: number; longitude: number } | null
+  directionsFrom: { latitude: number; longitude: number } | null
   travelMode: TravelMode
   onTravelModeChange: (mode: TravelMode) => void
   route: RouteSummary | { kind: 'fallback' } | null
@@ -1221,7 +1459,7 @@ function Directions({
       <div className="flex flex-wrap items-center gap-2">
         <a
           data-testid="directions-walk"
-          href={directionsUrl(provider, 'walk', restroom)}
+          href={directionsUrl(provider, 'walk', restroom, directionsFrom)}
           target="_blank"
           rel="noopener noreferrer"
           className={linkClass}
@@ -1231,7 +1469,7 @@ function Directions({
         </a>
         <a
           data-testid="directions-drive"
-          href={directionsUrl(provider, 'drive', restroom)}
+          href={directionsUrl(provider, 'drive', restroom, directionsFrom)}
           target="_blank"
           rel="noopener noreferrer"
           className={linkClass}

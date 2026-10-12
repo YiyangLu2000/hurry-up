@@ -2,7 +2,8 @@
  * OpenStreetMap → restroom rows. The one mapping used by live seeding
  * (src/server/restroom-routes.ts) and the bulk import tool
  * (src/server/restroom-admin-tools.ts), so both apply the same rules:
- * US only, public toilets unless private, fast food only with a brand.
+ * US only, public toilets unless private, fast food and cafés only with a
+ * brand (chains).
  */
 
 import { normalizeRestroom } from '../schemas/restrooms-schema'
@@ -47,7 +48,8 @@ export function toRestroom(el: OverpassElement): { recordId: string; data: Restr
   if (!isInUSOutline(latitude, longitude)) return null
 
   const isToilet = tags.amenity === 'toilets'
-  if (!isToilet && !(tags.amenity === 'fast_food' && tags.brand?.trim())) return null
+  const isChain = (tags.amenity === 'fast_food' || tags.amenity === 'cafe') && !!tags.brand?.trim()
+  if (!isToilet && !isChain) return null
   // Toilets explicitly closed to the public are not "public restrooms".
   if (isToilet && (tags.access === 'private' || tags.access === 'no')) return null
 
@@ -58,7 +60,7 @@ export function toRestroom(el: OverpassElement): { recordId: string; data: Restr
       name: tags.name ?? brand ?? 'Public restroom',
       latitude,
       longitude,
-      kind: isToilet ? 'public' : 'restaurant',
+      kind: isToilet ? 'public' : tags.amenity === 'cafe' ? 'cafe' : 'restaurant',
       ...(brand ? { brand } : {}),
       genderType: deriveGenderType(tags),
       wheelchair: deriveWheelchair(tags),

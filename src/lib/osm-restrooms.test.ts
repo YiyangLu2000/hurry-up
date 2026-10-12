@@ -69,3 +69,18 @@ describe('toRestroom', () => {
     expect(toRestroom({ ...node({ amenity: 'toilets' }), type: 'area' as never })).toBeNull()
   })
 })
+
+describe('cafés', () => {
+  it('keeps chain cafés (with a brand) as kind "cafe"', () => {
+    expect(toRestroom(node({ amenity: 'cafe', brand: 'Starbucks', name: 'Starbucks' }))?.data).toMatchObject({
+      kind: 'cafe',
+      brand: 'Starbucks',
+      name: 'Starbucks',
+    })
+  })
+
+  it('skips independent cafés (no brand)', () => {
+    expect(toRestroom(node({ amenity: 'cafe', name: 'Corner Coffee' }))).toBeNull()
+    expect(toRestroom(node({ amenity: 'cafe', brand: '  ' }))).toBeNull()
+  })
+})

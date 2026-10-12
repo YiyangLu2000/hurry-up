@@ -5,6 +5,8 @@
  *   node scripts/import-osm.mjs count
  *   node scripts/import-osm.mjs fetch  [--metros la,sf]
  *   node scripts/import-osm.mjs upload --app <name|url> [--metros la,sf]
+ *   … add --layer cafe to any command for chain cafés only (a separate pass
+ *   for metros imported before cafés were included; files under data/osm/cafe/)
  *
  * count  – asks Overpass only for counts; stops (exit 2) if the total of
  *          candidate rows exceeds 20,000.
@@ -65,13 +67,22 @@ function args() {
   }
   const metros = (opts.metros ?? Object.keys(METROS).join(',')).split(',')
   for (const m of metros) if (!METROS[m]) throw new Error(`Unknown metro "${m}". Known: ${Object.keys(METROS).join(', ')}`)
-  return { command, app: opts.app, metros }
+  const layer = opts.layer ?? 'base'
+  if (!LAYERS[layer]) throw new Error(`Unknown layer "${layer}". Known: ${Object.keys(LAYERS).join(', ')}`)
+  return { command, app: opts.app, metros, layer }
 }
 
-const selectors = (bbox) => {
-  const b = bbox.join(',')
-  return `nwr["amenity"="toilets"](${b});nwr["amenity"="fast_food"]["brand"](${b});`
+/**
+ * base: what the first import covered (public toilets, chain fast food).
+ * cafe: chain cafés, added later; same server rules, separate files/progress.
+ */
+const LAYERS = {
+  base: { dir: '', selectors: (b) => `nwr["amenity"="toilets"](${b});nwr["amenity"="fast_food"]["brand"](${b});` },
+  cafe: { dir: 'cafe', selectors: (b) => `nwr["amenity"="cafe"]["brand"](${b});` },
 }
+let LAYER = 'base'
+const selectors = (bbox) => LAYERS[LAYER].selectors(bbox.join(','))
+const metroDir = (m) => join(DATA_DIR, LAYERS[LAYER].dir, m)
 
 /** POST a query, trying each endpoint, with backoff between rounds. Returns parsed JSON. */
 async function overpass(query) {
@@ -132,7 +143,7 @@ async function count(metros) {
     await sleep(PAUSE_MS)
   }
   await mkdir(DATA_DIR, { recursive: true })
-  await writeFile(join(DATA_DIR, 'counts.json'), JSON.stringify({ countedAt: new Date().toISOString(), result, total }, null, 2))
+  await writeFile(join(DATA_DIR, `counts${LAYER === 'base' ? '' : '-' + LAYER}.json`), JSON.stringify({ countedAt: new Date().toISOString(), result, total }, null, 2))
   log(`total: ${total} candidate elements (before dropping private toilets and duplicates)`)
   if (total > ROW_LIMIT) {
     log(`STOP: ${total} exceeds the ${ROW_LIMIT} row limit. Nothing fetched or uploaded.`)
@@ -152,7 +163,7 @@ function trim(el) {
 async function fetchTiles(metros) {
   for (const m of metros) {
     const { name, bbox } = METROS[m]
-    const dir = join(DATA_DIR, m)
+    const dir = metroDir(m)
     await mkdir(dir, { recursive: true })
     const tiles = tilesFor(bbox)
     log(`${name}: ${tiles.length} tiles`)
@@ -221,11 +232,11 @@ async function upload(metros, app) {
   if (!app) throw new Error('upload needs --app <app name or URL>, e.g. --app http://localhost:5173 or --app hurry-up')
   const progressFile = join(DATA_DIR, 'progress.json')
   const progress = existsSync(progressFile) ? JSON.parse(await readFile(progressFile, 'utf8')) : {}
-  const key = (k) => `${app}|${k}`
+  const key = (k) => `${app}|${LAYER === 'base' ? '' : LAYER + ':'}${k}`
   const seen = new Set() // ways/relations spanning two tiles are sent once
   const totals = { created: 0, skipped: 0, failed: 0, rejected: 0 }
   for (const m of metros) {
-    const dir = join(DATA_DIR, m)
+    const dir = metroDir(m)
     if (!existsSync(dir)) {
       log(`${METROS[m].name}: no fetched tiles (run fetch first); skipping`)
       continue
@@ -262,7 +273,9 @@ async function upload(metros, app) {
     for (const k of Object.keys(totals)) totals[k] += metro[k]
 
     // Every batch of this metro is saved (a failure would have thrown above).
-    // Mark its cells covered only if every tile was fetched.
+    // Mark its cells covered only if every tile was fetched. The café layer
+    // adds to metros the base import already covered, so it marks nothing.
+    if (LAYER !== 'base') continue
     const missing = tilesFor(METROS[m].bbox).filter((t) => !files.includes(`${t.key}.json`))
     if (missing.length) {
       log(`${METROS[m].name}: ${missing.length} tile(s) not fetched; cells NOT marked covered (run fetch, then upload again)`)
@@ -283,7 +296,8 @@ async function upload(metros, app) {
   log(`done (this run): ${JSON.stringify(totals)}`)
 }
 
-const { command, app, metros } = args()
+const { command, app, metros, layer } = args()
+LAYER = layer
 if (command === 'count') await count(metros)
 else if (command === 'fetch') await fetchTiles(metros)
 else if (command === 'upload') await upload(metros, app)

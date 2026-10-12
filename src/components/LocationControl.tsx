@@ -6,12 +6,13 @@
  * tapping the map.
  */
 
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Locate, LocateFixed, LocateOff, MapPinned, Search, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { blockedLocationSteps } from '../lib/location'
 import { GEOCODER_ATTRIBUTION, parseCoordinates, searchPlaces, type Place } from '../lib/geocode'
 import { isInUSOutline } from '../lib/us-outline'
+import { clearLocationText, type LocationText } from '../lib/route-origin'
 import type { UserLocation } from '../lib/use-user-location'
 
 type Props = {
@@ -22,7 +23,11 @@ type Props = {
   /** A typed place or coordinates was chosen (already checked to be in the US). */
   onChoosePlace: (place: Place) => void
   onCancelPick: () => void
-  onRecenter: () => void
+  /**
+   * Switch back to the device location and pick the closest restroom from it.
+   * Returns false (and changes nothing) when the device location is unavailable.
+   */
+  onRecenter: () => boolean
 }
 
 function chipLabel(loc: UserLocation): { text: string; Icon: typeof Locate } {
@@ -53,6 +58,18 @@ export function LocationControl({
   onRecenter,
 }: Props) {
   const [open, setOpen] = useState(false)
+  const [recenterUnavailable, setRecenterUnavailable] = useState(false)
+  // The search box text lives here so it survives the panel closing. It shows
+  // the typed location; "Clear" empties it and nothing else.
+  const [locationText, setLocationText] = useState<LocationText<Place>>(() => ({
+    query: loc.manual?.label ?? '',
+    results: null,
+    message: null,
+  }))
+  const manualLabel = loc.manual?.label ?? ''
+  useEffect(() => {
+    setLocationText({ query: manualLabel, results: null, message: null })
+  }, [manualLabel, loc.manual?.latitude, loc.manual?.longitude])
   const { text, Icon } = chipLabel(loc)
   // Picking needs the map clear; the panel stays closed afterwards.
   const startPick = () => {
@@ -62,6 +79,15 @@ export function LocationControl({
   const choosePlace = (place: Place) => {
     setOpen(false)
     onChoosePlace(place)
+  }
+  const recenter = () => {
+    if (onRecenter()) {
+      setRecenterUnavailable(false)
+      setOpen(false)
+    } else {
+      // Leave the map alone; the status section below says what to do.
+      setRecenterUnavailable(true)
+    }
   }
 
   if (picking) {
@@ -87,7 +113,10 @@ export function LocationControl({
         type="button"
         data-testid="location-chip"
         aria-expanded={open}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          setRecenterUnavailable(false)
+          setOpen((o) => !o)
+        }}
         className={cn(
           'inline-flex items-center gap-1.5 rounded-full border border-border bg-card/95 px-3 py-1.5 text-xs font-medium text-card-foreground shadow-card backdrop-blur',
           loc.permission === 'denied' && loc.source !== 'manual' && 'text-muted-foreground',
@@ -114,16 +143,35 @@ export function LocationControl({
             </button>
           </div>
 
-          <PermissionSection loc={loc} onRecenter={onRecenter} />
+          {(loc.manual || loc.gps) && (
+            <div className="mb-3">
+              <button type="button" data-testid="recenter" onClick={recenter} className={buttonClass}>
+                Recenter on me
+              </button>
+              {recenterUnavailable && (
+                <p data-testid="recenter-unavailable" className="mt-2 text-xs text-muted-foreground">
+                  Your device location isn&apos;t available right now, so the map stays where it is.
+                </p>
+              )}
+            </div>
+          )}
 
-          <ManualSection loc={loc} onStartPick={startPick} onChoosePlace={choosePlace} />
+          <PermissionSection loc={loc} />
+
+          <ManualSection
+            loc={loc}
+            text={locationText}
+            onTextChange={setLocationText}
+            onStartPick={startPick}
+            onChoosePlace={choosePlace}
+          />
         </section>
       )}
     </div>
   )
 }
 
-function PermissionSection({ loc, onRecenter }: { loc: UserLocation; onRecenter: () => void }) {
+function PermissionSection({ loc }: { loc: UserLocation }) {
   if (loc.permission === 'denied') {
     const steps = blockedLocationSteps(navigator.userAgent, navigator.maxTouchPoints)
     return (
@@ -157,16 +205,10 @@ function PermissionSection({ loc, onRecenter }: { loc: UserLocation; onRecenter:
                 ? 'Location is on, but you appear to be outside the US, so it isn’t used.'
                 : 'Location is allowed, but your device couldn’t provide it.'}
         </p>
-        {loc.gpsStatus === 'ok' ? (
-          <button type="button" data-testid="recenter" onClick={onRecenter} className={buttonClass}>
-            Recenter on me
+        {loc.gpsStatus !== 'ok' && loc.gpsStatus !== 'locating' && (
+          <button type="button" onClick={loc.request} className={secondaryClass}>
+            Try again
           </button>
-        ) : (
-          loc.gpsStatus !== 'locating' && (
-            <button type="button" onClick={loc.request} className={secondaryClass}>
-              Try again
-            </button>
-          )
         )}
       </div>
     )
@@ -196,43 +238,48 @@ function PermissionSection({ loc, onRecenter }: { loc: UserLocation; onRecenter:
  */
 function ManualSection({
   loc,
+  text,
+  onTextChange,
   onStartPick,
   onChoosePlace,
 }: {
   loc: UserLocation
+  text: LocationText<Place>
+  onTextChange: (text: LocationText<Place>) => void
   onStartPick: () => void
   onChoosePlace: (place: Place) => void
 }) {
-  const [query, setQuery] = useState('')
-  const [results, setResults] = useState<Place[] | null>(null)
+  const { query, results, message } = text
+  const setQuery = (q: string) => onTextChange({ ...text, query: q })
+  const setResults = (r: Place[] | null) => onTextChange({ ...text, results: r })
+  const setMessage = (m: string | null) => onTextChange({ ...text, message: m })
   const [status, setStatus] = useState<'idle' | 'searching' | 'error'>('idle')
-  const [message, setMessage] = useState<string | null>(null)
 
   // One request per submit (never as-you-type), per the geocoder's policy.
   const submit = async (e: FormEvent) => {
     e.preventDefault()
-    const text = query.trim()
-    if (!text || status === 'searching') return
-    setMessage(null)
-    setResults(null)
-    const coords = parseCoordinates(text)
+    const q = query.trim()
+    if (!q || status === 'searching') return
+    const show = (patch: Partial<LocationText<Place>>) => onTextChange({ query, results: null, message: null, ...patch })
+    show({})
+    const coords = parseCoordinates(q)
     if (coords) {
       if (isInUSOutline(coords.latitude, coords.longitude)) {
         onChoosePlace({ ...coords, label: `${coords.latitude}, ${coords.longitude}` })
       } else {
-        setMessage('Those coordinates are outside the US.')
+        show({ message: 'Those coordinates are outside the US.' })
       }
       return
     }
     setStatus('searching')
     try {
-      const places = await searchPlaces(text)
+      const places = await searchPlaces(q)
       setStatus('idle')
-      if (places.length === 0) setMessage('No US places found. Try adding a city or ZIP code.')
-      else setResults(places)
+      if (places.length === 0) show({ message: 'No US places found. Try adding a city or ZIP code.' })
+      else show({ results: places })
     } catch {
       setStatus('error')
-      setMessage('Search is unavailable right now. You can tap the map instead.')
+      show({ message: 'Search is unavailable right now. You can tap the map instead.' })
     }
   }
 
@@ -245,20 +292,10 @@ function ManualSection({
       </p>
 
       {loc.manual && (
-        <div className="mb-2 flex items-start justify-between gap-2 rounded-md bg-muted px-2.5 py-1.5 text-xs">
-          <span data-testid="manual-label" className="min-w-0">
-            Using {loc.manual.label ? <strong className="break-words">{loc.manual.label}</strong> : 'a point you set on the map'}
-            {loc.gps ? ' instead of your device location' : ''}.
-          </span>
-          <button
-            type="button"
-            data-testid="clear-manual"
-            onClick={loc.clearManual}
-            className="shrink-0 font-medium underline underline-offset-2"
-          >
-            Clear
-          </button>
-        </div>
+        <p data-testid="manual-note" className="mb-2 text-xs text-muted-foreground">
+          Using a location you set{loc.manual.label ? ' (shown below)' : ' on the map'}
+          {loc.gps ? ' instead of your device location' : ''}.
+        </p>
       )}
 
       <form onSubmit={submit} className="flex gap-2" role="search">
@@ -279,6 +316,16 @@ function ManualSection({
         >
           <Search className="h-3.5 w-3.5" />
           {status === 'searching' ? 'Searching…' : 'Search'}
+        </button>
+        {/* Clears the text only: never the location, the map, or the route. */}
+        <button
+          type="button"
+          data-testid="clear-location"
+          onClick={() => onTextChange(clearLocationText(text))}
+          disabled={!query && !results && !message}
+          className={cn(secondaryClass, 'px-2.5 disabled:opacity-50')}
+        >
+          Clear
         </button>
       </form>
 
