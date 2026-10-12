@@ -126,3 +126,24 @@ describe('seedAround', () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 })
+
+describe('query', () => {
+  it('uses a plain bounding box (no Overpass area filter, which can fail silently as empty)', async () => {
+    const fetchMock = stubOverpass()
+    const { tools } = fakeTools()
+    await seedCell(tools, cell, NOW)
+    const body = decodeURIComponent(String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body).replace(/\+/g, ' '))
+    expect(body).not.toContain('area[')
+    expect(body).not.toContain('area.us')
+  })
+
+  it('keeps US-only on our side: elements outside the US are not saved', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      elements: [{ type: 'node', id: 7, lat: 32.51, lon: -117.0, tags: { amenity: 'toilets' } }], // Tijuana
+    }))))
+    const { tools, rows } = fakeTools()
+    const r = await seedCell(tools, cell, NOW)
+    expect(r).toMatchObject({ status: 'seeded', found: 0 })
+    expect(Object.keys(rows)).toHaveLength(0)
+  })
+})

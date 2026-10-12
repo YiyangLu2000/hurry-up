@@ -18,10 +18,12 @@ import { saveNewRestrooms } from './restroom-writes.js'
 
 const CELL_TTL_SECONDS = 7 * 24 * 60 * 60
 /**
- * Version of the mapping rules a live fetch used. Bump it when the rules
- * change (2: chain cafés added) so earlier fetches are re-done.
+ * Version of the rules a live fetch used. Bump it when they change so earlier
+ * fetches are re-done. 2: chain cafés added. 3: the query no longer uses an
+ * Overpass `area` filter (see overpassQuery); fetches before that may have
+ * come back wrongly empty.
  */
-export const SEED_RULES_VERSION = 2
+export const SEED_RULES_VERSION = 3
 const OVERPASS_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.kumi.systems/api/interpreter',
@@ -38,14 +40,19 @@ export class OverpassUnavailableError extends Error {}
 type AreaData = { fetchedAt?: number; coveredBy?: string; rulesVersion?: number }
 type Box = { south: number; west: number; north: number; east: number }
 
+/**
+ * Bounding box only. No `area["ISO3166-1"="US"]` filter: when an Overpass
+ * server cannot resolve that area it returns a valid but EMPTY answer, which
+ * would be saved as "no restrooms here". US-only is enforced on our side by
+ * toRestroom (isInUSOutline), the same as for the bulk import.
+ */
 function overpassQuery(box: Box): string {
   const bbox = `${box.south},${box.west},${box.north},${box.east}`
   return `[out:json][timeout:25];
-area["ISO3166-1"="US"][admin_level=2]->.us;
 (
-  nwr["amenity"="toilets"](area.us)(${bbox});
-  nwr["amenity"="fast_food"]["brand"](area.us)(${bbox});
-  nwr["amenity"="cafe"]["brand"](area.us)(${bbox});
+  nwr["amenity"="toilets"](${bbox});
+  nwr["amenity"="fast_food"]["brand"](${bbox});
+  nwr["amenity"="cafe"]["brand"](${bbox});
 );
 out center tags;`
 }
