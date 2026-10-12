@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ActionTools } from 'deepspace/worker'
 import { cellFromKey, cellsWithinRadius } from '../lib/us-geo'
+import { sampleScore, visibilityFor } from '../lib/scores'
 import { SEED_RULES_VERSION, seedAround, seedCell } from './restroom-seeding'
 
 const NOW = 1_800_000_000
@@ -10,6 +11,7 @@ const cell = cellFromKey('2382_-6117')! // Seattle, Eastlake
 /** In-memory stand-in for the RBAC-bypassing record tools. */
 function fakeTools(areas: Record<string, Record<string, unknown>> = {}) {
   const rows: Record<string, Record<string, unknown>> = {}
+  const scores: Record<string, Record<string, unknown>> = {}
   const tools = {
     get: vi.fn(async (collection: string, id: string) => {
       const data = collection === 'restroom_areas' ? areas[id] : rows[id]
@@ -17,11 +19,12 @@ function fakeTools(areas: Record<string, Record<string, unknown>> = {}) {
     }),
     create: vi.fn(async (collection: string, data: Record<string, unknown>, id: string) => {
       if (collection === 'restroom_areas') areas[id] = { ...areas[id], ...data }
+      else if (collection === 'restroom_scores') scores[id] = data
       else rows[id] = data
       return { success: true, data: { recordId: id } }
     }),
   }
-  return { tools: tools as unknown as ActionTools, areas, rows }
+  return { tools: tools as unknown as ActionTools, areas, rows, scores }
 }
 
 /** Overpass stub: answers with one public toilet inside the cell. */
@@ -56,10 +59,13 @@ describe('seedCell', () => {
 
   it('still calls Overpass for an uncovered cell, saves rows, then marks it fetched', async () => {
     const fetchMock = stubOverpass()
-    const { tools, areas, rows } = fakeTools()
+    const { tools, areas, rows, scores } = fakeTools()
     expect(await seedCell(tools, cell, NOW)).toEqual({ status: 'seeded', found: 1, created: 1 })
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(Object.keys(rows)).toEqual(['osm-node-42'])
+    // Created with its sample score and visibility, never left for the backfill.
+    expect(scores['osm-node-42']).toMatchObject({ sampleScore: sampleScore('osm-node-42'), ratingCount: 0 })
+    expect(rows['osm-node-42'].visibility).toBe(visibilityFor('active', sampleScore('osm-node-42')))
     expect(areas[cell.key]).toMatchObject({ cellKey: cell.key, fetchedAt: NOW, resultCount: 1, rulesVersion: SEED_RULES_VERSION })
     expect(areas[cell.key]).not.toHaveProperty('coveredBy')
   })

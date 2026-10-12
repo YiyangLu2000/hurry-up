@@ -15,6 +15,7 @@
  */
 
 import type { CollectionSchema } from 'deepspace/schema'
+import type { Visibility } from '../lib/scores.js'
 
 /** public toilet, chain fast food, or chain café (the last two may be for customers only). */
 export type RestroomKind = 'public' | 'restaurant' | 'cafe'
@@ -33,6 +34,12 @@ export interface Restroom {
   source: 'osm' | 'user'
   osmId?: string
   status: RestroomStatus
+  /**
+   * Who may see this restroom, computed only by the server from status and
+   * score (src/lib/scores.ts, src/server/restroom-scores.ts). Absent only on
+   * rows created before ratings, until the backfill sets it.
+   */
+  visibility?: Visibility
   /** Seeding-grid cell (`cellForPoint` in src/lib/us-geo.ts); server-computed. */
   cellKey: string
 }
@@ -72,6 +79,11 @@ export const restroomsSchema: CollectionSchema = {
       storage: 'text',
       interpretation: { kind: 'select', options: ['active', 'unavailable', 'pending'] },
       required: true,
+    },
+    {
+      name: 'visibility',
+      storage: 'text',
+      interpretation: { kind: 'select', options: ['public', 'premium', 'hidden'] },
     },
   ],
   // This uniqueOn exists for the SQLite index it creates on (cellKey, osmId),

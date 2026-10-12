@@ -32,6 +32,7 @@ import { registerAgent } from '../ai/agent.js'
 import { createActionTools } from './action-routes.js'
 import { resolveAgentAuth } from './http-routes.js'
 import { saveNewRestrooms } from './restroom-writes.js'
+import { backfillCell, recomputeRestroom, type BackfillResult } from './restroom-scores.js'
 import type { AppContext, Env } from '../../worker.js'
 
 /** Rows imported from OpenStreetMap are owned by this system identity, like live seeding. */
@@ -39,6 +40,12 @@ const SEEDER_USER_ID = 'system:osm-seeder'
 /** Keeps one request under the agent route's 64 KB body cap with trimmed tags. */
 const MAX_ELEMENTS_PER_CALL = 300
 const MAX_CELLS_PER_CALL = 1000
+/**
+ * Cells per backfill call. A first run makes about eight record calls per
+ * restroom, and the largest cells hold a few hundred restrooms; this keeps
+ * one call well inside a request's time and subrequest budget.
+ */
+const MAX_BACKFILL_CELLS_PER_CALL = 10
 
 const requestScope = new AsyncLocalStorage<{ env: Env; userId: string | null }>()
 
@@ -133,7 +140,7 @@ export function buildRestroomAdminTools(): ToolSet {
 
     restrooms_set_status: tool({
       description:
-        "Admin only. Set one restroom's status: active (shown to everyone), unavailable or pending (hidden from everyone but admins).",
+        "Admin only. Set one restroom's status: active (shown to everyone, or to members only when its score is above 4.0), unavailable or pending (hidden from everyone but admins). Recomputes its visibility.",
       inputSchema: z.object({ recordId: z.string().min(1), status: z.enum(STATUSES) }),
       execute: async ({ recordId, status }) => {
         const { env, userId } = await requireAdmin()
@@ -142,8 +149,59 @@ export function buildRestroomAdminTools(): ToolSet {
         if (!existing.success) return { ok: false, error: 'not_found', recordId }
         const previous = existing.data.record.data.status as RestroomStatus | undefined
         const res = await tools.update('restrooms', recordId, { status })
-        console.info(`[restrooms] status ${recordId}: ${previous} -> ${status} by ${userId}`)
-        return res.success ? { ok: true, recordId, previous, status } : { ok: false, error: res.error, recordId }
+        if (!res.success) return { ok: false, error: res.error, recordId }
+        // Status is an input to visibility; recompute it in the same call.
+        const recomputed = await recomputeRestroom(tools, recordId)
+        console.info(
+          `[restrooms] status ${recordId}: ${previous} -> ${status} by ${userId}, visibility=${recomputed?.visibility}`,
+        )
+        return { ok: true, recordId, previous, status, visibility: recomputed?.visibility }
+      },
+    }),
+
+    restrooms_list_cells: tool({
+      description:
+        'Admin only, read-only. Lists every grid cell that holds at least one restroom, with its restroom count. Use it to drive restrooms_backfill_scores.',
+      inputSchema: z.object({}),
+      execute: async () => {
+        const { env, userId } = await requireAdmin()
+        const tools = createActionTools(env, userId, '')
+        const all = await tools.query('restrooms')
+        if (!all.success) throw new Error(all.error)
+        const counts = new Map<string, number>()
+        let missingCell = 0
+        for (const r of (all.data as { records: { data: Partial<Restroom> }[] }).records) {
+          if (!r.data.cellKey) missingCell++
+          else counts.set(r.data.cellKey, (counts.get(r.data.cellKey) ?? 0) + 1)
+        }
+        const cells = [...counts].map(([cellKey, restrooms]) => ({ cellKey, restrooms }))
+        return { cells, restrooms: [...counts.values()].reduce((a, b) => a + b, 0), missingCell }
+      },
+    }),
+
+    restrooms_backfill_scores: tool({
+      description: `Admin only. For every restroom in the given cells (at most ${MAX_BACKFILL_CELLS_PER_CALL}), sets its sample score and its visibility (public, premium, hidden). Rated restrooms are recomputed from their ratings, never reset. Rows already correct are not written. Safe to re-run.`,
+      inputSchema: z.object({ cellKeys: z.array(z.string()).min(1).max(MAX_BACKFILL_CELLS_PER_CALL) }),
+      execute: async ({ cellKeys }) => {
+        const { env, userId } = await requireAdmin()
+        const tools = createActionTools(env, SEEDER_USER_ID, '')
+        const total: BackfillResult = { restrooms: 0, alreadySet: 0, recomputed: 0, failed: 0 }
+        let invalid = 0
+        for (const key of new Set(cellKeys)) {
+          if (!cellFromKey(key)) {
+            invalid++
+            continue
+          }
+          const r = await backfillCell(tools, key)
+          total.restrooms += r.restrooms
+          total.alreadySet += r.alreadySet
+          total.recomputed += r.recomputed
+          total.failed += r.failed
+        }
+        console.info(
+          `[restrooms] score backfill by ${userId}: cells=${cellKeys.length} restrooms=${total.restrooms} recomputed=${total.recomputed} alreadySet=${total.alreadySet} failed=${total.failed}`,
+        )
+        return { ...total, invalid }
       },
     }),
   }
