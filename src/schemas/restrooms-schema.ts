@@ -3,9 +3,14 @@
  *
  * `restrooms` is server-written only: the seeding route creates rows through
  * the RBAC-bypassing record tools, so no client role may create, update, or
- * delete. Reads use the 'published' level with `status = 'active'` as the
- * visibility value. Rows are created by a system identity, so no real user is
- * ever the owner and every non-admin caller sees exactly the active rows.
+ * delete. Reads use the 'published' level with `visibility = 'public'` as the
+ * visibility value: non-admins read only public rows (active, score 4.0 or
+ * below). 'premium' rows (active, above 4.0) reach members only through
+ * POST /api/restrooms/premium; 'hidden' rows (unavailable, pending) only
+ * admins. The server computes `visibility` from status and score
+ * (src/server/restroom-scores.ts). Rows are created by a system identity, so
+ * no real user is ever the owner and the owner half of 'published' matches
+ * nobody (phase 3 changes that for submissions; see CLAUDE.md).
  *
  * Clients load restrooms per seeding-grid cell (`where: { cellKey }`), never
  * the whole collection. Every server write goes through `normalizeRestroom`.
@@ -15,6 +20,7 @@
  */
 
 import type { CollectionSchema } from 'deepspace/schema'
+import type { Visibility } from '../lib/scores.js'
 
 /** public toilet, chain fast food, or chain café (the last two may be for customers only). */
 export type RestroomKind = 'public' | 'restaurant' | 'cafe'
@@ -33,6 +39,12 @@ export interface Restroom {
   source: 'osm' | 'user'
   osmId?: string
   status: RestroomStatus
+  /**
+   * Who may see this restroom, computed only by the server from status and
+   * score (src/lib/scores.ts, src/server/restroom-scores.ts). Absent only on
+   * rows created before ratings, until the backfill sets it.
+   */
+  visibility?: Visibility
   /** Seeding-grid cell (`cellForPoint` in src/lib/us-geo.ts); server-computed. */
   cellKey: string
 }
@@ -73,6 +85,11 @@ export const restroomsSchema: CollectionSchema = {
       interpretation: { kind: 'select', options: ['active', 'unavailable', 'pending'] },
       required: true,
     },
+    {
+      name: 'visibility',
+      storage: 'text',
+      interpretation: { kind: 'select', options: ['public', 'premium', 'hidden'] },
+    },
   ],
   // This uniqueOn exists for the SQLite index it creates on (cellKey, osmId),
   // which turns the client's per-cell `where: { cellKey }` query into an index
@@ -83,7 +100,7 @@ export const restroomsSchema: CollectionSchema = {
   // (future user submissions) store NULL, and NULL never conflicts — see
   // normalizeRestroom and restrooms-schema.test.ts.
   uniqueOn: ['cellKey', 'osmId'],
-  visibilityField: { field: 'status', value: 'active' },
+  visibilityField: { field: 'visibility', value: 'public' },
   permissions: {
     '*': { read: 'published', ...NO_WRITES },
     viewer: { read: 'published', ...NO_WRITES },

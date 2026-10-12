@@ -3,7 +3,10 @@
  *
  * Restrooms come from the `restrooms` collection, loaded per grid cell in view
  * (RestroomCells: one `useQuery` per cell, `where: { cellKey }`); the server only
- * ships rows the caller may read (active ones, for everyone but admins). The
+ * ships rows the caller may read (public ones: active, score 4.0 or below —
+ * everything for admins). Top-rated (premium) restrooms come from
+ * /api/restrooms/premium for members only and are merged in by record id;
+ * non-members never receive them and see a note instead. The
  * map asks /api/restrooms/seed to fill in OpenStreetMap data for the grid
  * cells in view whenever it settles at a useful zoom.
  *
@@ -23,11 +26,14 @@ import type {
   Marker as MapLibreMarker,
 } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import { useAuthProfileReady } from 'deepspace'
-import { Accessibility, Car, Coffee, Footprints, Info, Loader2, MapPin, Route as RouteIcon, Utensils, X } from 'lucide-react'
+import { AuthOverlay, useAuthProfileReady } from 'deepspace'
+import { Accessibility, Car, Coffee, Footprints, Info, Loader2, MapPin, Route as RouteIcon, Star, Utensils, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LocationControl } from '../../components/LocationControl'
 import { RestroomCells, type CellRecords } from '../../components/RestroomCells'
+import { RestroomRating } from '../../components/RestroomRating'
+import { useToast } from '@/components/ui'
+import { usePremiumRestrooms } from '../../lib/use-premium-restrooms'
 import {
   directionsUrl,
   distanceMeters,
@@ -70,6 +76,7 @@ import {
   type RouteTarget,
 } from '../../lib/route-origin'
 import { useUserLocation } from '../../lib/use-user-location'
+import { useRefreshNonce } from '../../lib/use-refresh-nonce'
 import {
   GENDER_TYPES,
   RESTROOM_KINDS,
@@ -85,6 +92,8 @@ const SEED_BACKOFF_BASE_MS = 30_000
 const SEED_BACKOFF_MAX_MS = 10 * 60_000
 const KIND_COLOR: Record<RestroomKind, string> = { public: '#0d9488', restaurant: '#ea580c', cafe: '#92400e' }
 const UNAVAILABLE_COLOR = '#9ca3af'
+/** Ring around top-rated (premium) restrooms. */
+const PREMIUM_RING_COLOR = '#d97706'
 /** Below this zoom no cells load and restroom markers hide. */
 const MIN_VIEW_ZOOM = 12
 /** Cells subscribed for one view, nearest the centre first. */
@@ -136,6 +145,9 @@ export default function HomePage() {
   const [subscribedCells, setSubscribedCells] = useState<string[]>([])
   const [cellData, setCellData] = useState<Map<string, CellRecords>>(() => new Map())
   const [zoomedOut, setZoomedOut] = useState(false)
+  // Re-subscribes the loaded cells every 2 minutes and on tab refocus, so
+  // restrooms that became premium or unavailable leave open maps.
+  const refreshNonce = useRefreshNonce()
   const onCellReport = useCallback((key: string, value: CellRecords | null) => {
     setCellData((prev) => {
       if (!value && !prev.has(key)) return prev
@@ -145,7 +157,29 @@ export default function HomePage() {
       return next
     })
   }, [])
-  const records = useMemo(() => [...cellData.values()].flatMap((c) => c.records), [cellData])
+  // Premium restrooms for members (the server decides who that is), merged
+  // with the collection's rows by record id — admins read premium rows from
+  // the collection too, and the collection's copy wins. Only for loaded cells.
+  const premium = usePremiumRestrooms(user?.id ?? null, subscribedCells, refreshNonce)
+  // Restrooms this visitor's own rating just made members-only: dropped at
+  // once, until the server's next snapshot stops sending them (see below).
+  const [droppedIds, setDroppedIds] = useState<ReadonlySet<string>>(() => new Set())
+  const collectionRecords = useMemo(() => [...cellData.values()].flatMap((c) => c.records), [cellData])
+  const records = useMemo(() => {
+    const seen = new Set(collectionRecords.map((r) => r.recordId))
+    const merged = [
+      ...collectionRecords,
+      ...premium.records.filter((r) => !seen.has(r.recordId) && cellData.has(r.data.cellKey)),
+    ]
+    return droppedIds.size > 0 ? merged.filter((r) => !droppedIds.has(r.recordId)) : merged
+  }, [collectionRecords, premium.records, cellData, droppedIds])
+  useEffect(() => {
+    if (droppedIds.size === 0) return
+    const stillSent = new Set(collectionRecords.map((r) => r.recordId))
+    if ([...droppedIds].some((id) => !stillSent.has(id))) {
+      setDroppedIds((prev) => new Set([...prev].filter((id) => stillSent.has(id))))
+    }
+  }, [collectionRecords, droppedIds])
   const recordsStatus =
     subscribedCells.length > 0 && subscribedCells.every((k) => cellData.get(k)?.ready) ? 'ready' : 'loading'
 
@@ -325,6 +359,20 @@ export default function HomePage() {
     [markInteraction],
   )
 
+  const { info: toastInfo } = useToast()
+  const [showSignIn, setShowSignIn] = useState(false)
+  // This visitor's rating made the restroom premium and they are not a
+  // member: drop it here at once (other open maps lose it on their next
+  // re-subscribe). Its loaded cell no longer holds it, so its panel and any
+  // route to it close through the "removed while selected" effect.
+  const onMembersOnly = useCallback(
+    (id: string) => {
+      setDroppedIds((prev) => new Set(prev).add(id))
+      toastInfo('This restroom is now members only.', 'Your rating made it top rated. Top-rated restrooms are for members.')
+    },
+    [toastInfo],
+  )
+
   // Seeding. A cell is requested until it succeeds (or is refused as outside
   // the US). A failure stops the batch — Overpass being down affects every
   // cell — and backs off exponentially before the next automatic attempt.
@@ -442,8 +490,14 @@ export default function HomePage() {
           paint: {
             'circle-radius': ['match', ['get', 'kind'], ['restaurant', 'cafe'], 6, 8],
             'circle-color': markerColor,
-            'circle-stroke-width': ['match', ['get', 'kind'], ['restaurant', 'cafe'], 1.5, 3],
-            'circle-stroke-color': '#ffffff',
+            // Top-rated (premium) restrooms get a thick amber ring.
+            'circle-stroke-width': [
+              'case',
+              ['==', ['get', 'visibility'], 'premium'],
+              3.5,
+              ['match', ['get', 'kind'], ['restaurant', 'cafe'], 1.5, 3],
+            ],
+            'circle-stroke-color': ['case', ['==', ['get', 'visibility'], 'premium'], PREMIUM_RING_COLOR, '#ffffff'],
           },
         })
         // Route line under every marker: a white casing, then a solid line for a
@@ -665,7 +719,7 @@ export default function HomePage() {
       features: mapRecords.map((r) => ({
         type: 'Feature',
         geometry: { type: 'Point', coordinates: [r.data.longitude, r.data.latitude] },
-        properties: { id: r.recordId, kind: r.data.kind, status: r.data.status },
+        properties: { id: r.recordId, kind: r.data.kind, status: r.data.status, visibility: r.data.visibility ?? '' },
       })),
     })
   }, [mapRecords, mapReady])
@@ -1051,7 +1105,7 @@ export default function HomePage() {
       <div className="absolute inset-0">
         <div ref={containerRef} className="h-full w-full" data-testid="restroom-map" />
       </div>
-      <RestroomCells cellKeys={cellKeysToLoad} onReport={onCellReport} />
+      <RestroomCells cellKeys={cellKeysToLoad} refreshNonce={refreshNonce} onReport={onCellReport} />
 
       {/* Above the details panel: an open location panel must stay usable. */}
       <div className="pointer-events-none absolute inset-x-3 top-3 z-20 flex flex-col gap-2 sm:right-auto sm:w-80">
@@ -1102,6 +1156,12 @@ export default function HomePage() {
               ) : (
                 `Nothing within 5 km${filtersActive ? ' matching your filters' : ''}.`
               )}
+            </p>
+          )}
+          {premium.membership === 'non-member' && (
+            <p data-testid="members-note" className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+              <Star className="h-3.5 w-3.5 shrink-0 fill-amber-400 text-amber-500" aria-hidden />
+              Top-rated restrooms are for members.
             </p>
           )}
           {seedState === 'error' && (
@@ -1188,8 +1248,17 @@ export default function HomePage() {
           routePending={routePending}
           showAdminInfo={isAdmin}
           onClose={() => select(null)}
-        />
+        >
+          <RestroomRating
+            key={selected.recordId}
+            restroomId={selected.recordId}
+            signedIn={!!user}
+            onSignIn={() => setShowSignIn(true)}
+            onMembersOnly={() => onMembersOnly(selected.recordId)}
+          />
+        </RestroomDetails>
       )}
+      {showSignIn && <AuthOverlay onClose={() => setShowSignIn(false)} />}
       </div>
 
       {overlay && (
@@ -1286,6 +1355,7 @@ function RestroomDetails({
   routePending,
   showAdminInfo,
   onClose,
+  children,
 }: {
   id: string
   restroom: Restroom
@@ -1298,6 +1368,8 @@ function RestroomDetails({
   routePending: boolean
   showAdminInfo: boolean
   onClose: () => void
+  /** The score and star rating (RestroomRating). */
+  children: React.ReactNode
 }) {
   // Restaurants and cafés are businesses: their restroom may be for customers only.
   const isBusiness = restroom.kind !== 'public'
@@ -1311,6 +1383,12 @@ function RestroomDetails({
       <div className="flex items-start justify-between gap-3">
         <div>
           <h2 className="text-base font-semibold">{restroom.name}</h2>
+          {restroom.visibility === 'premium' && (
+            <p data-testid="top-rated-badge" className="mt-0.5 inline-flex items-center gap-1 text-xs font-medium text-amber-700 dark:text-amber-400">
+              <Star className="h-3 w-3 fill-current" aria-hidden />
+              Top rated · members only
+            </p>
+          )}
           <p className="text-xs text-muted-foreground">
             {restroom.kind === 'cafe'
               ? `Café${brandSuffix}`
@@ -1346,6 +1424,8 @@ function RestroomDetails({
           {restroom.wheelchair === 'yes' ? 'Yes' : restroom.wheelchair === 'no' ? 'No' : 'Unknown'}
         </li>
       </ul>
+
+      {children}
 
       {isBusiness && (
         <p className="mt-3 flex items-start gap-2 rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">
